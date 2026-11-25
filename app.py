@@ -81,7 +81,7 @@ class Order(BaseModel):
 class Action(BaseModel):
  action:str
 @app.get('/')
-def home(): return FileResponse(BASE/'static/index.html',headers={'Cache-Control':'no-store'})
+def home(): return FileResponse(BASE/'index.html',headers={'Cache-Control':'no-store'})
 @app.get('/health')
 def health():
  with connect() as c: c.execute('SELECT 1 FROM users LIMIT 1')
