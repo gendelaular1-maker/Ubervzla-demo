@@ -1,5 +1,6 @@
 """UBERVZLA demo. Synthetic data only; single instance SQLite."""
-import os, sqlite3, time, secrets, hashlib, hmac, math, threading
+import os, sqlite3, time, secrets, hashlib, hmac, math, threading, json
+from datetime import date, datetime, timezone
 from contextlib import contextmanager, asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
@@ -37,6 +38,11 @@ def init():
  CREATE TABLE IF NOT EXISTS shops(uid INTEGER PRIMARY KEY REFERENCES users(id), category TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY, merchant INTEGER REFERENCES shops(uid), name TEXT NOT NULL, price_cents INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS shop_orders(order_id INTEGER PRIMARY KEY REFERENCES orders(id), merchant INTEGER REFERENCES shops(uid), product_name TEXT, product_cents INTEGER);
+ CREATE TABLE IF NOT EXISTS driver_reviews(uid INTEGER PRIMARY KEY REFERENCES users(id), status TEXT NOT NULL DEFAULT 'pending', submitted INTEGER NOT NULL DEFAULT 0, checks TEXT NOT NULL DEFAULT '{}', expires REAL NOT NULL DEFAULT 0, updated REAL NOT NULL DEFAULT 0);
+ CREATE TABLE IF NOT EXISTS review_audit(id INTEGER PRIMARY KEY, uid INTEGER REFERENCES users(id), decision TEXT NOT NULL, checks TEXT NOT NULL, ts REAL NOT NULL);
+ CREATE TABLE IF NOT EXISTS demo_face_challenges(token TEXT PRIMARY KEY, uid INTEGER REFERENCES users(id), purpose TEXT, expiry REAL, binding TEXT, cents INTEGER DEFAULT 0);
+ CREATE TABLE IF NOT EXISTS demo_face_sessions(token TEXT PRIMARY KEY);
+ CREATE TABLE IF NOT EXISTS demo_withdrawals(id INTEGER PRIMARY KEY, uid INTEGER REFERENCES users(id), cents INTEGER, ts REAL);
  CREATE INDEX IF NOT EXISTS orders_status ON orders(status,created);
  CREATE TABLE IF NOT EXISTS driver_gps(uid INTEGER PRIMARY KEY REFERENCES users(id), lat REAL, lon REAL, accuracy REAL, seen REAL);
  CREATE TABLE IF NOT EXISTS order_gps(oid INTEGER PRIMARY KEY REFERENCES orders(id), plat REAL, plon REAL, dlat REAL, dlon REAL);
@@ -47,6 +53,17 @@ def init():
     c.execute(f"ALTER TABLE {table} ADD COLUMN gps_mode INTEGER NOT NULL DEFAULT 0")
    if 'gps_room' not in {r['name'] for r in c.execute(f'PRAGMA table_info({table})')}:
     c.execute(f"ALTER TABLE {table} ADD COLUMN gps_room TEXT NOT NULL DEFAULT ''")
+  c.execute("INSERT OR IGNORE INTO driver_reviews(uid) SELECT id FROM users WHERE role='driver'")
+  c.execute("UPDATE users SET online=0 WHERE role='driver' AND id NOT IN (SELECT uid FROM driver_reviews WHERE status='approved' AND expires>?)",(time.time(),))
+CHECKS={'identity':'Cédula de identidad','selfie':'Selfie y prueba de vida','phone':'Teléfono +58','email':'Correo electrónico','license':'Licencia de conducir','medical':'Certificado médico vial','title':'Título o certificado del vehículo','circulation':'Carnet de circulación','insurance':'Seguro RCV','background':'Antecedentes penales','vehicle':'Inspección del carro o moto'}
+EXPIRING=('license','medical','insurance')
+def qualified(c,uid):
+ return bool(c.execute("SELECT 1 FROM driver_reviews WHERE uid=? AND status='approved' AND expires>?",(uid,time.time())).fetchone())
+def review_info(c,uid):
+ row=c.execute('SELECT * FROM driver_reviews WHERE uid=?',(uid,)).fetchone()
+ if not row: return {'status':'pending','submitted':False,'checks':{},'eligible':False}
+ status='expired' if row['status']=='approved' and row['expires']<=time.time() else row['status']
+ return {'status':status,'submitted':bool(row['submitted']),'checks':json.loads(row['checks']),'eligible':qualified(c,uid),'expires':row['expires']}
 def event(c,i,e): c.execute('INSERT INTO events(order_id,event,ts) VALUES(?,?,?)',(i,e,time.time()))
 def dist(a,b):
  la,lo=POINTS[a]; lb,ob=POINTS[b]; return math.hypot((la-lb)*111,(lo-ob)*109)
@@ -56,6 +73,8 @@ def km(a,b):
  return 6371*2*math.asin(math.sqrt(min(1,max(0,h))))
 def tick(c):
  now=time.time()
+ c.execute("UPDATE users SET online=0 WHERE role='driver' AND id NOT IN (SELECT uid FROM driver_reviews WHERE status='approved' AND expires>?)",(now,))
+ c.execute("DELETE FROM driver_gps WHERE uid IN (SELECT id FROM users WHERE online=0) AND uid NOT IN (SELECT driver FROM orders WHERE status IN ('accepted','arrived','in_progress') AND driver IS NOT NULL)")
  c.execute('DELETE FROM driver_gps WHERE seen<?',(now-GPS_TTL,))
  c.execute("DELETE FROM order_gps WHERE oid IN (SELECT id FROM orders WHERE status IN ('completed','cancelled'))")
  # Expire old GPS orders if never accepted. Do not cancel active rides automatically.
@@ -65,7 +84,7 @@ def tick(c):
   c.execute("UPDATE attempts SET result='expired' WHERE order_id=? AND driver=?",(o['id'],o['driver']))
   c.execute("UPDATE orders SET status='pending',driver=NULL,deadline=NULL,updated=? WHERE id=?",(now,o['id'])); event(c,o['id'],'offer_expired')
  for o in c.execute("SELECT * FROM orders WHERE status='pending' ORDER BY created,id").fetchall():
-  eligible=c.execute("""SELECT u.* FROM users u WHERE role='driver' AND online=1 AND last_seen>=? AND (vehicle=? OR ?='any') AND u.gps_mode=? AND (u.gps_mode=0 OR u.gps_room=?) AND NOT EXISTS(SELECT 1 FROM orders x WHERE x.driver=u.id AND x.status IN ('offered','accepted','arrived','in_progress')) AND NOT EXISTS(SELECT 1 FROM attempts a WHERE a.order_id=? AND a.driver=u.id)""",(now-60,SERVICES[o['service']],SERVICES[o['service']],o['gps_mode'],o['gps_room'],o['id'])).fetchall()
+  eligible=c.execute("""SELECT u.* FROM users u WHERE role='driver' AND online=1 AND EXISTS(SELECT 1 FROM driver_reviews v WHERE v.uid=u.id AND v.status='approved' AND v.expires>?) AND last_seen>=? AND (vehicle=? OR ?='any') AND u.gps_mode=? AND (u.gps_mode=0 OR u.gps_room=?) AND NOT EXISTS(SELECT 1 FROM orders x WHERE x.driver=u.id AND x.status IN ('offered','accepted','arrived','in_progress')) AND NOT EXISTS(SELECT 1 FROM attempts a WHERE a.order_id=? AND a.driver=u.id)""",(now,now-60,SERVICES[o['service']],SERVICES[o['service']],o['gps_mode'],o['gps_room'],o['id'])).fetchall()
   if not eligible: continue
   if o['gps_mode']:
    g=c.execute('SELECT * FROM order_gps WHERE oid=?',(o['id'],)).fetchone()
@@ -104,10 +123,12 @@ def cookie_name(r): return 'ubervzla_'+portal(r)
 def user(c,r):
  token=r.cookies.get(cookie_name(r),''); u=c.execute('SELECT u.* FROM users u JOIN sessions s ON s.uid=u.id WHERE s.token=? AND s.expiry>?',(hashlib.sha256(token.encode()).hexdigest(),time.time())).fetchone()
  if not u or u['role']!=portal(r): raise HTTPException(401,'Inicia sesión')
+ if u['role']=='driver' and not c.execute('SELECT 1 FROM demo_face_sessions WHERE token=?',(hashlib.sha256(token.encode()).hexdigest(),)).fetchone(): raise HTTPException(401,'Reingresa y completa el paso facial demo')
  return u
 def public(u): return {k:u[k] for k in ('id','name','login','role','vehicle','zone','online','gps_mode')}
 def session(c,u):
  token=secrets.token_urlsafe(32); c.execute('DELETE FROM sessions WHERE expiry<?',(time.time(),)); c.execute('INSERT INTO sessions VALUES(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),u['id'],time.time()+86400))
+ if u['role']=='driver': c.execute('INSERT INTO demo_face_sessions VALUES(?)',(hashlib.sha256(token.encode()).hexdigest(),))
  res=JSONResponse(public(u)); res.set_cookie('ubervzla_'+u['role'],token,max_age=86400,httponly=True,samesite='strict',secure=os.getenv('RENDER')=='true' or os.getenv('SECURE_COOKIES')=='1'); return res
 class Register(BaseModel):
  name:str=Field(min_length=2,max_length=40); login:str=Field(min_length=3,max_length=32,pattern=r'^[a-zA-Z0-9_-]+$'); password:str=Field(min_length=8,max_length=100); role:str; vehicle:str=''; zone:str='El Viñedo'; category:str=''
@@ -133,7 +154,7 @@ def portal_page(r:Request):
 @app.get('/health')
 def health():
  with connect() as c: c.execute('SELECT 1 FROM users LIMIT 1')
- return {'status':'ok','version':'0.6.0-driver-independent-demo','mode':'TEST_ONLY'}
+ return {'status':'ok','version':'0.7.1-driver-approval-face-demo','mode':'TEST_ONLY'}
 @app.post('/api/register')
 def register(data:Register,r:Request):
  if data.role!=portal(r): raise HTTPException(403,'Registro no corresponde a esta plataforma')
@@ -142,14 +163,16 @@ def register(data:Register,r:Request):
  with tx() as c:
   try: i=c.execute('INSERT INTO users(name,login,pw,role,vehicle,zone) VALUES(?,?,?,?,?,?)',(data.name.strip(),data.login.lower(),hashpw(data.password),data.role,data.vehicle if data.role=='driver' else '',data.zone)).lastrowid
   except sqlite3.IntegrityError: raise HTTPException(409,'Ese usuario ya existe')
+  if data.role=='driver': c.execute('INSERT INTO driver_reviews(uid) VALUES(?)',(i,))
   if data.role=='merchant': c.execute('INSERT INTO shops VALUES(?,?)',(i,data.category))
-  return session(c,c.execute('SELECT * FROM users WHERE id=?',(i,)).fetchone())
+  u=c.execute('SELECT * FROM users WHERE id=?',(i,)).fetchone()
+  return face_challenge(c,u,'login') if u['role']=='driver' else session(c,u)
 @app.post('/api/login')
 def login(data:Login,r:Request):
  with tx() as c:
   u=c.execute('SELECT * FROM users WHERE login=?',(data.login.lower(),)).fetchone()
   if not u or u['role']!=portal(r) or not hmac.compare_digest(u['pw'],hashpw(data.password,u['pw'].split(':')[0])): raise HTTPException(401,'Usuario o clave incorrectos')
-  return session(c,u)
+  return face_challenge(c,u,'login') if u['role']=='driver' else session(c,u)
 @app.post('/api/logout')
 def logout(r:Request):
  with tx() as c:
@@ -164,6 +187,7 @@ def availability(data:Availability,r:Request):
  with tx() as c:
   u=user(c,r)
   if u['role']!='driver': raise HTTPException(403,'Solo conductores')
+  if data.online and not qualified(c,u['id']): raise HTTPException(403,'Cuenta no aprobada o documentos vencidos (demo)')
   if data.gps_mode and data.online and len(data.room.strip())<8: raise HTTPException(400,'Código de prueba: mínimo 8 caracteres')
   room=hashlib.sha256(data.room.strip().encode()).hexdigest() if data.gps_mode and data.room.strip() else u['gps_room'] if data.gps_mode else ''
   if (bool(u['gps_mode'])!=data.gps_mode or u['gps_room']!=room) and c.execute("SELECT 1 FROM orders WHERE driver=? AND status IN ('offered','accepted','arrived','in_progress')",(u['id'],)).fetchone(): raise HTTPException(409,'Finaliza o rechaza la orden antes de cambiar modo')
@@ -214,6 +238,7 @@ def action(oid:int,data:Action,r:Request):
   elif u['role']=='merchant' and a=='ready' and state=='preparing' and c.execute('SELECT 1 FROM shop_orders WHERE order_id=? AND merchant=?',(oid,u['id'])).fetchone():
    c.execute("UPDATE orders SET status='pending',updated=? WHERE id=?",(now,oid)); event(c,oid,'merchant_ready')
   elif u['role']=='driver' and o['driver']==u['id']:
+   if a=='accept' and not qualified(c,u['id']): raise HTTPException(403,'Cuenta no autorizada')
    if a in ('accept','reject') and state=='offered' and o['deadline']>now:
     c.execute('UPDATE attempts SET result=? WHERE order_id=? AND driver=?',(a,oid,u['id']))
     if a=='accept': c.execute("UPDATE orders SET status='accepted',deadline=NULL,updated=? WHERE id=?",(now,oid))
@@ -251,7 +276,7 @@ def state(r:Request):
      if fix: o['driver_gps']=dict(fix)
    orders.append(o)
   products=[dict(p) for p in c.execute('SELECT id,name,price_cents FROM products WHERE merchant=?',(u['id'],))] if u['role']=='merchant' else []
-  return JSONResponse({'products':products,'me':public(c.execute('SELECT * FROM users WHERE id=?',(u['id'],)).fetchone()),'orders':orders,'points':POINTS,'now':time.time(),'demo':True},headers={'Cache-Control':'no-store'})
+  return JSONResponse({'products':products,'me':public(c.execute('SELECT * FROM users WHERE id=?',(u['id'],)).fetchone()),'review':review_info(c,u['id']) if u['role']=='driver' else None,'wallet_demo_cents':wallet(c,u['id']) if u['role']=='driver' else 0,'orders':orders,'points':POINTS,'now':time.time(),'demo':True},headers={'Cache-Control':'no-store'})
 
 class Product(BaseModel):
  name:str=Field(min_length=2,max_length=80); price_cents:int=Field(ge=1,le=1000000)
@@ -282,3 +307,98 @@ def purchase(data:Purchase,r:Request):
   now=time.time(); price=round(PRICES['delivery']+dist(p['zone'],data.destination)*.4,2)
   i=c.execute("INSERT INTO orders(customer,service,pickup,destination,price,status,created,updated) VALUES(?,?,?,?,?,'preparing',?,?)",(u['id'],'delivery',p['zone'],data.destination,price,now,now)).lastrowid
   c.execute('INSERT INTO shop_orders VALUES(?,?,?,?)',(i,p['merchant'],p['name'],p['price_cents'])); event(c,i,'purchase_created'); return {'id':i,'price':price,'total':round(price+p['price_cents']/100,2)}
+
+
+# DEMO ONLY: no personal documents, biometric processing or real checks.
+class ReviewDecision(BaseModel):
+ decision:str
+ checks:dict[str,bool]=Field(default_factory=dict)
+ dates:dict[str,str]=Field(default_factory=dict)
+
+def admin_auth(r):
+ key=os.getenv('UBERVZLA_ADMIN_KEY','')
+ if len(key)<32: raise HTTPException(503,'Panel sin configurar. Define UBERVZLA_ADMIN_KEY de al menos 32 caracteres.')
+ supplied=r.headers.get('Authorization','')
+ if not hmac.compare_digest(supplied.encode(),('Bearer '+key).encode()): raise HTTPException(401,'Acceso administrativo inválido')
+@app.get('/admin')
+def admin_page():
+ return HTMLResponse((BASE/'admin.html').read_text(encoding='utf-8'),headers={'Cache-Control':'no-store'})
+@app.post('/api/review/submit')
+def submit_review(r:Request):
+ with tx() as c:
+  u=user(c,r)
+  if u['role']!='driver': raise HTTPException(403,'Solo conductor')
+  current=review_info(c,u['id'])
+  if current['status'] not in ('pending','correction','expired','rejected'): raise HTTPException(409,'No puedes reenviar esta solicitud')
+  c.execute("UPDATE driver_reviews SET submitted=1,status='pending',checks='{}',expires=0,updated=? WHERE uid=?",(time.time(),u['id']))
+  c.execute("INSERT INTO review_audit(uid,decision,checks,ts) VALUES(?,'submitted','{}',?)",(u['id'],time.time()))
+  return review_info(c,u['id'])
+@app.get('/api/admin/drivers')
+def admin_drivers(r:Request):
+ admin_auth(r)
+ with tx() as c:
+  return JSONResponse({'checks':CHECKS,'expiring':EXPIRING,'drivers':[{'id':u['id'],'name':u['name'],'login':u['login'],'vehicle':u['vehicle'],**review_info(c,u['id'])} for u in c.execute("SELECT * FROM users WHERE role='driver' ORDER BY id DESC")]},headers={'Cache-Control':'no-store'})
+@app.post('/api/admin/drivers/{uid}')
+def decide_review(uid:int,data:ReviewDecision,r:Request):
+ admin_auth(r)
+ if data.decision not in ('approved','correction','rejected','suspended'): raise HTTPException(400,'Decisión inválida')
+ with tx() as c:
+  row=c.execute('SELECT * FROM driver_reviews WHERE uid=?',(uid,)).fetchone()
+  if not row: raise HTTPException(404,'Conductor no encontrado')
+  expires=0
+  checks={k:bool(data.checks.get(k,False)) for k in CHECKS}
+  if data.decision=='approved':
+   if not row['submitted'] or not all(checks.values()): raise HTTPException(400,'Solicitud y todos los controles demo son obligatorios')
+   try: stamps=[datetime.fromisoformat(data.dates[k]).replace(tzinfo=timezone.utc).timestamp()+86400 for k in EXPIRING]
+   except (ValueError,KeyError,OverflowError): raise HTTPException(400,'Indica las tres fechas de vigencia ficticias')
+   expires=min(stamps)
+   if expires<=time.time(): raise HTTPException(400,'Hay documentos de prueba vencidos')
+  payload=json.dumps(checks)
+  c.execute('UPDATE driver_reviews SET status=?,checks=?,expires=?,updated=? WHERE uid=?',(data.decision,payload,expires,time.time(),uid))
+  c.execute('INSERT INTO review_audit(uid,decision,checks,ts) VALUES(?,?,?,?)',(uid,data.decision,json.dumps({'checks':checks,'dates':{k:data.dates.get(k) for k in EXPIRING}}),time.time()))
+  tick(c)
+  return review_info(c,uid)
+
+
+# The following is a UX/state-machine simulation. No camera, biometric comparison,
+# live payout or official identity verification is enabled by this code.
+def wallet(c,uid):
+ earned=sum(round(round(r['price']*.85,2)*100) for r in c.execute("SELECT price FROM orders WHERE driver=? AND status='completed'",(uid,)))
+ paid=c.execute('SELECT COALESCE(SUM(cents),0) FROM demo_withdrawals WHERE uid=?',(uid,)).fetchone()[0]
+ return max(0,earned-paid)
+def face_challenge(c,u,purpose,binding='',cents=0):
+ c.execute('DELETE FROM demo_face_challenges WHERE expiry<=?',(time.time(),))
+ c.execute('DELETE FROM demo_face_challenges WHERE uid=? AND purpose=?',(u['id'],purpose))
+ token=secrets.token_urlsafe(32)
+ c.execute('INSERT INTO demo_face_challenges VALUES(?,?,?,?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),u['id'],purpose,time.time()+120,binding,cents))
+ return {'face_demo_required':True,'challenge':token,'purpose':purpose,'expires_in':120,'demo_only':True}
+class FaceDemo(BaseModel):
+ challenge:str=Field(min_length=20,max_length=128)
+ confirm_demo:bool
+class DemoWithdraw(BaseModel):
+ cents:int=Field(gt=0,le=10000000)
+@app.post('/api/face-demo/confirm')
+def face_confirm(data:FaceDemo,r:Request):
+ if portal(r)!='driver' or not data.confirm_demo: raise HTTPException(400,'Confirmación demo requerida')
+ with tx() as c:
+  h=hashlib.sha256(data.challenge.encode()).hexdigest()
+  row=c.execute('SELECT * FROM demo_face_challenges WHERE token=? AND expiry>?',(h,time.time())).fetchone()
+  if not row: raise HTTPException(400,'Prueba facial vencida o usada; vuelve a empezar')
+  u=c.execute('SELECT * FROM users WHERE id=?',(row['uid'],)).fetchone()
+  if row['purpose']=='login':
+   c.execute('DELETE FROM demo_face_challenges WHERE token=?',(h,))
+   return session(c,u)
+  current=user(c,r)
+  binding=hashlib.sha256(r.cookies.get(cookie_name(r),'').encode()).hexdigest()
+  if current['id']!=u['id'] or row['binding']!=binding or row['purpose']!='withdraw': raise HTTPException(403,'Prueba no corresponde a esta sesión')
+  if not qualified(c,u['id']) or wallet(c,u['id'])<row['cents']: raise HTTPException(409,'Cuenta no autorizada o saldo demo insuficiente')
+  c.execute('DELETE FROM demo_face_challenges WHERE token=?',(h,))
+  c.execute('INSERT INTO demo_withdrawals(uid,cents,ts) VALUES(?,?,?)',(u['id'],row['cents'],time.time()))
+  return {'demo_only':True,'money_sent':False,'wallet_demo_cents':wallet(c,u['id'])}
+@app.post('/api/withdraw-demo/start')
+def withdraw_demo(data:DemoWithdraw,r:Request):
+ with tx() as c:
+  u=user(c,r)
+  if u['role']!='driver' or not qualified(c,u['id']): raise HTTPException(403,'Cuenta no autorizada')
+  if wallet(c,u['id'])<data.cents: raise HTTPException(400,'Saldo demo insuficiente')
+  return face_challenge(c,u,'withdraw',hashlib.sha256(r.cookies.get(cookie_name(r),'').encode()).hexdigest(),data.cents)
