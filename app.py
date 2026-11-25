@@ -157,7 +157,7 @@ def portal_page(r:Request):
 @app.get('/health')
 def health():
  with connect() as c: c.execute('SELECT 1 FROM users LIMIT 1')
- return {'status':'ok','version':'0.8.1-private-intake-foundation','mode':'INTAKE_ONLY','dispatch_enabled':False,'payout_enabled':False}
+ return {'status':'ok','version':'0.8.3-contact-integration','mode':'INTAKE_ONLY','dispatch_enabled':False,'payout_enabled':False}
 @app.post('/api/register')
 def register(data:Register,r:Request):
  if data.role!=portal(r): raise HTTPException(403,'Registro no corresponde a esta plataforma')
@@ -424,8 +424,8 @@ def withdraw_demo(data:DemoWithdraw,r:Request):
 
 # Device passkeys: genuine WebAuthn signatures, separate from simulated facial checks.
 # Only this fixed HTTPS origin may enroll or authenticate credentials.
-PASSKEY_ORIGIN='https://ubervzla-demo.onrender.com'
-PASSKEY_RP='ubervzla-demo.onrender.com'
+PASSKEY_ORIGIN=os.getenv('UBERVZLA_ORIGIN','https://ubervzla-demo.onrender.com').rstrip('/')
+PASSKEY_RP=PASSKEY_ORIGIN.removeprefix('https://')
 class PasskeyEnroll(BaseModel):
  password:str=Field(min_length=8,max_length=100)
 class PasskeyLogin(BaseModel):
@@ -548,6 +548,7 @@ def foundation_init():
   c.execute('CREATE TABLE IF NOT EXISTS intake_invites_used(digest TEXT PRIMARY KEY,used REAL NOT NULL)')
   c.execute('CREATE TABLE IF NOT EXISTS intake_profiles(uid INTEGER PRIMARY KEY REFERENCES users(id), payload BLOB NOT NULL, submitted INTEGER NOT NULL DEFAULT 0, updated REAL NOT NULL)')
   c.execute('CREATE TABLE IF NOT EXISTS intake_files(uid INTEGER REFERENCES users(id), kind TEXT, payload BLOB NOT NULL, mime TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY(uid,kind))')
+  c.execute('CREATE TABLE IF NOT EXISTS intake_contact(uid INTEGER REFERENCES users(id), channel TEXT, fingerprint TEXT, provider_sid TEXT, verified INTEGER DEFAULT 0, sent REAL DEFAULT 0, window REAL DEFAULT 0, sends INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, nonce TEXT, PRIMARY KEY(uid,channel))')
   c.execute('UPDATE users SET online=0')
   c.execute("UPDATE driver_reviews SET status='pending',submitted=0,expires=0,checks='{}'")
 
@@ -565,11 +566,11 @@ async def production_guard(request, call_next):
  if p.startswith('/api/') and request.method in ('GET','HEAD') and p not in ('/api/intake/status','/api/intake/admin','/api/support/contact'):
   return JSONResponse({'detail':'Módulo no habilitado'},status_code=403)
  if p.startswith('/api/') and request.method not in ('GET','HEAD'):
-  if p not in ('/api/register','/api/login','/api/logout','/api/intake/profile','/api/intake/file','/api/intake/submit'):
+  if p not in ('/api/register','/api/login','/api/logout','/api/intake/profile','/api/intake/file','/api/intake/submit','/api/intake/contact/send','/api/intake/contact/check'):
    return JSONResponse({'detail':'Operación bloqueada: falta integración de seguridad o pagos real'},status_code=403)
   if request.headers.get('origin') not in (PASSKEY_ORIGIN,):
    return JSONResponse({'detail':'Origen no autorizado'},status_code=403)
-  if p in ('/api/register','/api/login','/api/intake/profile','/api/intake/file','/api/intake/submit'):
+  if p in ('/api/register','/api/login','/api/intake/profile','/api/intake/file','/api/intake/submit','/api/intake/contact/send','/api/intake/contact/check'):
    try: vault()
    except HTTPException as e: return JSONResponse({'detail':e.detail},status_code=e.status_code)
   if p in ('/api/register','/api/login') and request.headers.get('X-Portal')!='driver':
@@ -610,7 +611,7 @@ def intake_status(r:Request):
   if u['role']!='driver': raise HTTPException(403,'Solo aspirantes')
   row=c.execute('SELECT submitted FROM intake_profiles WHERE uid=?',(u['id'],)).fetchone()
   files=[x['kind'] for x in c.execute('SELECT kind FROM intake_files WHERE uid=?',(u['id'],))]
-  return {'profile_saved':bool(row),'submitted':bool(row and row['submitted']),'files':files,'eligible':False,'status':'awaiting_verification' if row and row['submitted'] else 'incomplete'}
+  return {'profile_saved':bool(row),'submitted':bool(row and row['submitted']),'files':files,'contacts':contact_status(c,u['id']),'contact_provider_configured':bool(verify_config()),'document_upload_enabled':os.getenv('UBERVZLA_DOCUMENT_UPLOAD_ENABLED')=='1','eligible':False,'status':'awaiting_verification' if row and row['submitted'] else 'incomplete'}
 
 def intake_user(c,r):
  u=user(c,r)
@@ -627,12 +628,19 @@ def intake_profile(data:IntakeProfile,r:Request):
  with tx() as c:
   u,_=intake_user(c,r)
   if u['vehicle']!=data.vehicle: raise HTTPException(400,'El vehículo debe coincidir con el registro')
+  prior=c.execute('SELECT payload FROM intake_profiles WHERE uid=?',(u['id'],)).fetchone()
+  if prior:
+   old=json.loads(key.decrypt(prior['payload']))
+   if any(old.get(k)!=getattr(data,k) for k in ('phone','email')):
+    c.execute('DELETE FROM intake_contact WHERE uid=?',(u['id'],))
+    c.execute('DELETE FROM intake_files WHERE uid=?',(u['id'],))
   c.execute('INSERT INTO intake_profiles(uid,payload,submitted,updated) VALUES(?,?,0,?) ON CONFLICT(uid) DO UPDATE SET payload=excluded.payload,updated=excluded.updated',(u['id'],key.encrypt(data.model_dump_json().encode()),time.time()))
  return {'saved':True}
 
 @app.post('/api/intake/file')
 def intake_file(data:IntakeFile,r:Request):
  key=vault()
+ if os.getenv('UBERVZLA_DOCUMENT_UPLOAD_ENABLED')!='1': raise HTTPException(503,'Recepción de documentos no habilitada')
  if data.kind not in DOCS: raise HTTPException(400,'Documento inválido')
  try: raw=base64.b64decode(data.content,validate=True)
  except (ValueError,binascii.Error): raise HTTPException(400,'Archivo inválido')
@@ -644,6 +652,7 @@ def intake_file(data:IntakeFile,r:Request):
  with tx() as c:
   u,row=intake_user(c,r)
   if not row: raise HTTPException(409,'Completa los datos primero')
+  if not all(contact_status(c,u['id']).values()): raise HTTPException(409,'Verifica teléfono y correo antes de cargar documentos')
   if data.kind=='selfie':
    found={x['kind'] for x in c.execute('SELECT kind FROM intake_files WHERE uid=?',(u['id'],))}
    if not set(DOCS[:-1])<=found: raise HTTPException(409,'Completa los documentos antes de la selfie')
@@ -654,9 +663,11 @@ def intake_file(data:IntakeFile,r:Request):
 @app.post('/api/intake/submit')
 def intake_submit(r:Request):
  vault()
+ if os.getenv('UBERVZLA_DOCUMENT_UPLOAD_ENABLED')!='1': raise HTTPException(503,'Recepción de documentos no habilitada')
  with tx() as c:
   u,row=intake_user(c,r)
   found={x['kind'] for x in c.execute('SELECT kind FROM intake_files WHERE uid=?',(u['id'],))}
+  if not all(contact_status(c,u['id']).values()): raise HTTPException(409,'Verifica teléfono y correo')
   if not row or found!=set(DOCS): raise HTTPException(409,'Expediente incompleto')
   c.execute('UPDATE intake_profiles SET submitted=1,updated=? WHERE uid=?',(time.time(),u['id']))
  return {'submitted':True,'eligible':False,'status':'awaiting_verification'}
@@ -668,11 +679,12 @@ def intake_admin(r:Request):
   result=[]
   for x in c.execute('SELECT uid,payload,submitted,updated FROM intake_profiles ORDER BY updated DESC LIMIT 100'):
    data=json.loads(key.decrypt(x['payload'])); files=[z['kind'] for z in c.execute('SELECT kind FROM intake_files WHERE uid=?',(x['uid'],))]
-   result.append({'id':x['uid'],'name':data['full_name'],'vehicle':data['vehicle'],'state':data['state'],'submitted':bool(x['submitted']),'files':files,'eligible':False})
+   result.append({'id':x['uid'],'name':data['full_name'],'vehicle':data['vehicle'],'state':data['state'],'submitted':bool(x['submitted']),'files':files,'contacts':contact_status(c,x['uid']),'eligible':False})
   return {'applicants':result,'approval_enabled':False}
 
 
 @app.get('/soporte')
+@app.get('/support')
 def support_page():
  return FileResponse(BASE/'support.html',media_type='text/html')
 
@@ -680,3 +692,82 @@ def support_page():
 def support_contact():
  email=os.getenv('UBERVZLA_SUPPORT_EMAIL','').strip()
  return {'email':email if re.fullmatch(r"[A-Za-z0-9._+%-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",email) else None}
+
+
+# Contact verification: provider responses only, no local bypass.
+from urllib.request import Request as HTTPRequest, urlopen
+from urllib.parse import urlencode
+from urllib.error import HTTPError, URLError
+
+def verify_config():
+ sid=os.getenv('UBERVZLA_VERIFY_SERVICE_SID',''); kid=os.getenv('UBERVZLA_VERIFY_KEY_SID',''); secret=os.getenv('UBERVZLA_VERIFY_KEY_SECRET','')
+ return (sid,kid,secret) if re.fullmatch(r'VA[0-9a-fA-F]{32}',sid) and re.fullmatch(r'SK[0-9a-fA-F]{32}',kid) and secret else None
+
+def verify_request(endpoint, fields):
+ config=verify_config()
+ if not config: raise HTTPException(503,'Proveedor de códigos aún no configurado')
+ sid,kid,secret=config
+ auth=base64.b64encode((kid+':'+secret).encode()).decode()
+ req=HTTPRequest('https://verify.twilio.com/v2/Services/'+sid+'/'+endpoint,data=urlencode(fields).encode(),headers={'Authorization':'Basic '+auth,'Content-Type':'application/x-www-form-urlencoded'},method='POST')
+ try:
+  with urlopen(req,timeout=12) as res: return json.loads(res.read(65536))
+ except HTTPError as e:
+  if e.code==429: raise HTTPException(429,'Demasiadas solicitudes. Intenta más tarde')
+  if e.code in (400,404) and endpoint=='VerificationCheck': raise HTTPException(400,'Código inválido o vencido')
+  raise HTTPException(502,'No se pudo completar la verificación con el proveedor')
+ except (URLError,TimeoutError,ValueError): raise HTTPException(502,'Servicio de verificación no disponible')
+
+def contact_status(c,uid):
+ rows={x['channel']:bool(x['verified']) for x in c.execute('SELECT channel,verified FROM intake_contact WHERE uid=?',(uid,))}
+ return {k:rows.get(k,False) for k in ('phone','email')}
+
+def contact_value(c,uid,channel,key):
+ row=c.execute('SELECT payload FROM intake_profiles WHERE uid=?',(uid,)).fetchone()
+ if not row: raise HTTPException(409,'Guarda los datos primero')
+ value=json.loads(key.decrypt(row['payload']))[channel]
+ fingerprint=hmac.new(os.environ['UBERVZLA_VAULT_KEY'].encode(),(channel+':'+value).encode(),hashlib.sha256).hexdigest()
+ return value,fingerprint
+
+class ContactSend(BaseModel):
+ channel:str=Field(pattern=r'^(phone|email)$')
+class ContactCheck(ContactSend):
+ code:str=Field(pattern=r'^[0-9]{4,10}$')
+
+@app.post('/api/intake/contact/send')
+def contact_send(data:ContactSend,r:Request):
+ key=vault()
+ if not verify_config(): raise HTTPException(503,'Proveedor de códigos aún no configurado')
+ with tx() as c:
+  u,_=intake_user(c,r);uid=u['id']; value,fp=contact_value(c,uid,data.channel,key); now=time.time()
+  row=c.execute('SELECT * FROM intake_contact WHERE uid=? AND channel=?',(uid,data.channel)).fetchone()
+  if row and row['verified']: return {'verified':True}
+  if row and now-row['sent']<60: raise HTTPException(429,'Espera 60 segundos antes de reenviar')
+  window=row['window'] if row and now-row['window']<3600 else now
+  sends=row['sends'] if row and window==row['window'] else 0
+  if sends>=3: raise HTTPException(429,'Límite de envíos por hora alcanzado')
+  nonce=secrets.token_hex(16)
+  c.execute('INSERT INTO intake_contact VALUES(?,?,?,NULL,0,?,?,?,0,?) ON CONFLICT(uid,channel) DO UPDATE SET fingerprint=excluded.fingerprint,provider_sid=NULL,verified=0,sent=excluded.sent,window=excluded.window,sends=excluded.sends,attempts=0,nonce=excluded.nonce',(uid,data.channel,fp,now,window,sends+1,nonce))
+ result=verify_request('Verifications',{'To':value,'Channel':'sms' if data.channel=='phone' else 'email'})
+ sid=result.get('sid','')
+ if result.get('status')!='pending' or not re.fullmatch(r'VE[0-9a-fA-F]{32}',sid): raise HTTPException(502,'El proveedor no confirmó el envío')
+ with tx() as c:
+  n=c.execute('UPDATE intake_contact SET provider_sid=? WHERE uid=? AND channel=? AND nonce=? AND fingerprint=?',(sid,uid,data.channel,nonce,fp)).rowcount
+  if not n: raise HTTPException(409,'Los datos cambiaron. Solicita un nuevo código')
+ return {'sent':True,'verified':False}
+
+@app.post('/api/intake/contact/check')
+def contact_check(data:ContactCheck,r:Request):
+ key=vault()
+ with tx() as c:
+  u,_=intake_user(c,r);uid=u['id']; value,fp=contact_value(c,uid,data.channel,key)
+  row=c.execute('SELECT * FROM intake_contact WHERE uid=? AND channel=?',(uid,data.channel)).fetchone()
+  if row and row['verified']: return {'verified':True}
+  if not row or row['fingerprint']!=fp or not row['provider_sid'] or time.time()-row['sent']>600: raise HTTPException(409,'Solicita un nuevo código')
+  if row['attempts']>=5: raise HTTPException(429,'Límite de intentos alcanzado. Solicita un nuevo código')
+  c.execute('UPDATE intake_contact SET attempts=attempts+1 WHERE uid=? AND channel=?',(uid,data.channel));sid=row['provider_sid'];nonce=row['nonce']
+ result=verify_request('VerificationCheck',{'VerificationSid':sid,'Code':data.code})
+ if result.get('status')!='approved' or result.get('valid') is not True or result.get('sid')!=sid: raise HTTPException(400,'Código no aprobado')
+ with tx() as c:
+  n=c.execute('UPDATE intake_contact SET verified=1 WHERE uid=? AND channel=? AND nonce=? AND fingerprint=? AND provider_sid=?',(uid,data.channel,nonce,fp,sid)).rowcount
+  if not n: raise HTTPException(409,'Los datos cambiaron. Solicita un nuevo código')
+ return {'verified':True}
