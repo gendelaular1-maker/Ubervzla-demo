@@ -42,6 +42,8 @@ def init():
  CREATE TABLE IF NOT EXISTS review_audit(id INTEGER PRIMARY KEY, uid INTEGER REFERENCES users(id), decision TEXT NOT NULL, checks TEXT NOT NULL, ts REAL NOT NULL);
  CREATE TABLE IF NOT EXISTS demo_face_challenges(token TEXT PRIMARY KEY, uid INTEGER REFERENCES users(id), purpose TEXT, expiry REAL, binding TEXT, cents INTEGER DEFAULT 0);
  CREATE TABLE IF NOT EXISTS demo_face_sessions(token TEXT PRIMARY KEY);
+ CREATE TABLE IF NOT EXISTS driver_passkeys(id BLOB PRIMARY KEY, uid INTEGER NOT NULL REFERENCES users(id), pubkey BLOB NOT NULL, sign_count INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS passkey_requests(id TEXT PRIMARY KEY, uid INTEGER NOT NULL REFERENCES users(id), purpose TEXT NOT NULL, challenge BLOB NOT NULL, expires REAL NOT NULL, binding TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS demo_withdrawals(id INTEGER PRIMARY KEY, uid INTEGER REFERENCES users(id), cents INTEGER, ts REAL);
  CREATE INDEX IF NOT EXISTS orders_status ON orders(status,created);
  CREATE TABLE IF NOT EXISTS driver_gps(uid INTEGER PRIMARY KEY REFERENCES users(id), lat REAL, lon REAL, accuracy REAL, seen REAL);
@@ -57,6 +59,7 @@ def init():
   c.execute("UPDATE users SET online=0 WHERE role='driver' AND id NOT IN (SELECT uid FROM driver_reviews WHERE status='approved' AND expires>?)",(time.time(),))
 CHECKS={'identity':'Cédula de identidad','selfie':'Selfie y prueba de vida','phone':'Teléfono +58','email':'Correo electrónico','license':'Licencia de conducir','medical':'Certificado médico vial','title':'Título o certificado del vehículo','circulation':'Carnet de circulación','insurance':'Seguro RCV','background':'Antecedentes penales','vehicle':'Inspección del carro o moto'}
 EXPIRING=('license','medical','insurance')
+ONBOARD_DOCS=tuple(k for k in CHECKS if k!='selfie')
 def qualified(c,uid):
  return bool(c.execute("SELECT 1 FROM driver_reviews WHERE uid=? AND status='approved' AND expires>?",(uid,time.time())).fetchone())
 def review_info(c,uid):
@@ -123,12 +126,12 @@ def cookie_name(r): return 'ubervzla_'+portal(r)
 def user(c,r):
  token=r.cookies.get(cookie_name(r),''); u=c.execute('SELECT u.* FROM users u JOIN sessions s ON s.uid=u.id WHERE s.token=? AND s.expiry>?',(hashlib.sha256(token.encode()).hexdigest(),time.time())).fetchone()
  if not u or u['role']!=portal(r): raise HTTPException(401,'Inicia sesión')
- if u['role']=='driver' and not c.execute('SELECT 1 FROM demo_face_sessions WHERE token=?',(hashlib.sha256(token.encode()).hexdigest(),)).fetchone(): raise HTTPException(401,'Reingresa y completa el paso facial demo')
+ if u['role']=='driver' and qualified(c,u['id']) and not c.execute('SELECT 1 FROM demo_face_sessions WHERE token=?',(hashlib.sha256(token.encode()).hexdigest(),)).fetchone(): raise HTTPException(401,'Reingresa y completa el paso facial demo')
  return u
 def public(u): return {k:u[k] for k in ('id','name','login','role','vehicle','zone','online','gps_mode')}
-def session(c,u):
+def session(c,u,face=True):
  token=secrets.token_urlsafe(32); c.execute('DELETE FROM sessions WHERE expiry<?',(time.time(),)); c.execute('INSERT INTO sessions VALUES(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),u['id'],time.time()+86400))
- if u['role']=='driver': c.execute('INSERT INTO demo_face_sessions VALUES(?)',(hashlib.sha256(token.encode()).hexdigest(),))
+ if u['role']=='driver' and face: c.execute('INSERT INTO demo_face_sessions VALUES(?)',(hashlib.sha256(token.encode()).hexdigest(),))
  res=JSONResponse(public(u)); res.set_cookie('ubervzla_'+u['role'],token,max_age=86400,httponly=True,samesite='strict',secure=os.getenv('RENDER')=='true' or os.getenv('SECURE_COOKIES')=='1'); return res
 class Register(BaseModel):
  name:str=Field(min_length=2,max_length=40); login:str=Field(min_length=3,max_length=32,pattern=r'^[a-zA-Z0-9_-]+$'); password:str=Field(min_length=8,max_length=100); role:str; vehicle:str=''; zone:str='El Viñedo'; category:str=''
@@ -154,7 +157,7 @@ def portal_page(r:Request):
 @app.get('/health')
 def health():
  with connect() as c: c.execute('SELECT 1 FROM users LIMIT 1')
- return {'status':'ok','version':'0.7.1-driver-approval-face-demo','mode':'TEST_ONLY'}
+ return {'status':'ok','version':'0.7.3-documents-first-demo','mode':'TEST_ONLY'}
 @app.post('/api/register')
 def register(data:Register,r:Request):
  if data.role!=portal(r): raise HTTPException(403,'Registro no corresponde a esta plataforma')
@@ -166,13 +169,13 @@ def register(data:Register,r:Request):
   if data.role=='driver': c.execute('INSERT INTO driver_reviews(uid) VALUES(?)',(i,))
   if data.role=='merchant': c.execute('INSERT INTO shops VALUES(?,?)',(i,data.category))
   u=c.execute('SELECT * FROM users WHERE id=?',(i,)).fetchone()
-  return face_challenge(c,u,'login') if u['role']=='driver' else session(c,u)
+  return session(c,u,face=False) if u['role']=='driver' else session(c,u)
 @app.post('/api/login')
 def login(data:Login,r:Request):
  with tx() as c:
   u=c.execute('SELECT * FROM users WHERE login=?',(data.login.lower(),)).fetchone()
   if not u or u['role']!=portal(r) or not hmac.compare_digest(u['pw'],hashpw(data.password,u['pw'].split(':')[0])): raise HTTPException(401,'Usuario o clave incorrectos')
-  return face_challenge(c,u,'login') if u['role']=='driver' else session(c,u)
+  return face_challenge(c,u,'login') if u['role']=='driver' and review_info(c,u['id'])['submitted'] else session(c,u,face=False)
 @app.post('/api/logout')
 def logout(r:Request):
  with tx() as c:
@@ -323,16 +326,18 @@ def admin_auth(r):
 @app.get('/admin')
 def admin_page():
  return HTMLResponse((BASE/'admin.html').read_text(encoding='utf-8'),headers={'Cache-Control':'no-store'})
+class DemoDocuments(BaseModel):
+ documents:list[str]=Field(default_factory=list,max_length=20)
 @app.post('/api/review/submit')
-def submit_review(r:Request):
+def submit_review(data:DemoDocuments,r:Request):
  with tx() as c:
   u=user(c,r)
   if u['role']!='driver': raise HTTPException(403,'Solo conductor')
   current=review_info(c,u['id'])
-  if current['status'] not in ('pending','correction','expired','rejected'): raise HTTPException(409,'No puedes reenviar esta solicitud')
-  c.execute("UPDATE driver_reviews SET submitted=1,status='pending',checks='{}',expires=0,updated=? WHERE uid=?",(time.time(),u['id']))
-  c.execute("INSERT INTO review_audit(uid,decision,checks,ts) VALUES(?,'submitted','{}',?)",(u['id'],time.time()))
-  return review_info(c,u['id'])
+  if current['status'] not in ('pending','correction','expired','rejected') or (current['status']=='pending' and current['submitted']): raise HTTPException(409,'No puedes reenviar esta solicitud')
+  if set(data.documents)!=set(ONBOARD_DOCS): raise HTTPException(400,'Completa todos los documentos ficticios y controles antes de la selfie')
+  binding=hashlib.sha256(r.cookies.get(cookie_name(r),'').encode()).hexdigest()
+  return face_challenge(c,u,'onboarding',binding)
 @app.get('/api/admin/drivers')
 def admin_drivers(r:Request):
  admin_auth(r)
@@ -390,7 +395,15 @@ def face_confirm(data:FaceDemo,r:Request):
    return session(c,u)
   current=user(c,r)
   binding=hashlib.sha256(r.cookies.get(cookie_name(r),'').encode()).hexdigest()
-  if current['id']!=u['id'] or row['binding']!=binding or row['purpose']!='withdraw': raise HTTPException(403,'Prueba no corresponde a esta sesión')
+  if current['id']!=u['id'] or row['binding']!=binding: raise HTTPException(403,'Prueba no corresponde a esta sesión')
+  if row['purpose']=='onboarding':
+   v=review_info(c,u['id'])
+   if v['status'] not in ('pending','correction','expired','rejected') or (v['status']=='pending' and v['submitted']): raise HTTPException(409,'La solicitud ya no se puede enviar')
+   c.execute('DELETE FROM demo_face_challenges WHERE token=?',(h,))
+   c.execute("UPDATE driver_reviews SET submitted=1,status='pending',checks='{}',expires=0,updated=? WHERE uid=?",(time.time(),u['id']))
+   c.execute("INSERT INTO review_audit(uid,decision,checks,ts) VALUES(?,'submitted',?,?)",(u['id'],json.dumps({'demo_documents':ONBOARD_DOCS,'selfie_demo':True}),time.time()))
+   return review_info(c,u['id'])
+  if row['purpose']!='withdraw': raise HTTPException(403,'Prueba no corresponde a esta sesión')
   if not qualified(c,u['id']) or wallet(c,u['id'])<row['cents']: raise HTTPException(409,'Cuenta no autorizada o saldo demo insuficiente')
   c.execute('DELETE FROM demo_face_challenges WHERE token=?',(h,))
   c.execute('INSERT INTO demo_withdrawals(uid,cents,ts) VALUES(?,?,?)',(u['id'],row['cents'],time.time()))
@@ -402,3 +415,117 @@ def withdraw_demo(data:DemoWithdraw,r:Request):
   if u['role']!='driver' or not qualified(c,u['id']): raise HTTPException(403,'Cuenta no autorizada')
   if wallet(c,u['id'])<data.cents: raise HTTPException(400,'Saldo demo insuficiente')
   return face_challenge(c,u,'withdraw',hashlib.sha256(r.cookies.get(cookie_name(r),'').encode()).hexdigest(),data.cents)
+
+
+# Device passkeys: genuine WebAuthn signatures, separate from simulated facial checks.
+# Only this fixed HTTPS origin may enroll or authenticate credentials.
+PASSKEY_ORIGIN='https://ubervzla-demo.onrender.com'
+PASSKEY_RP='ubervzla-demo.onrender.com'
+class PasskeyEnroll(BaseModel):
+ password:str=Field(min_length=8,max_length=100)
+class PasskeyLogin(BaseModel):
+ login:str=Field(min_length=3,max_length=32)
+class PasskeyFinish(BaseModel):
+ request_id:str=Field(min_length=20,max_length=128)
+ credential:dict
+
+def passkey_lib(r):
+ if portal(r)!='driver' or r.headers.get('origin')!=PASSKEY_ORIGIN:
+  raise HTTPException(403,'Abre UBERVZLA Driver desde su dirección HTTPS oficial')
+ try:
+  import webauthn as w
+  from webauthn.helpers import structs as st
+ except ImportError:
+  raise HTTPException(503,'Acceso rápido no disponible; usa el acceso normal')
+ return w,st
+
+def pk_session_binding(r):
+ return hashlib.sha256(r.cookies.get('ubervzla_driver','').encode()).hexdigest()
+
+def pk_request(c,uid,purpose,challenge,binding):
+ now=time.time()
+ c.execute('DELETE FROM passkey_requests WHERE expires<=?',(now,))
+ if c.execute('SELECT COUNT(*) FROM passkey_requests WHERE uid=? AND purpose=?',(uid,purpose)).fetchone()[0]>=8:
+  raise HTTPException(429,'Demasiadas solicitudes. Intenta más tarde.')
+ rid=secrets.token_urlsafe(32)
+ c.execute('INSERT INTO passkey_requests VALUES(?,?,?,?,?,?)',(rid,uid,purpose,challenge,now+120,binding))
+ return rid
+
+def pk_get(c,rid,purpose,binding):
+ row=c.execute('SELECT * FROM passkey_requests WHERE id=? AND purpose=? AND expires>? AND binding=?',(rid,purpose,time.time(),binding)).fetchone()
+ if not row: raise HTTPException(400,'Solicitud vencida o inválida. Vuelve a empezar.')
+ return row
+
+@app.post('/api/passkey/enroll/start')
+def passkey_enroll_start(data:PasskeyEnroll,r:Request):
+ w,st=passkey_lib(r)
+ with tx() as c:
+  u=user(c,r)
+  if not qualified(c,u['id']): raise HTTPException(403,'Solo cuentas aprobadas para pruebas')
+  if not hmac.compare_digest(hashpw(data.password,u['pw'].split(':')[0]),u['pw']): raise HTTPException(401,'Contraseña incorrecta')
+  rows=c.execute('SELECT id FROM driver_passkeys WHERE uid=?',(u['id'],)).fetchall()
+  if len(rows)>=5: raise HTTPException(409,'Máximo cinco llaves. Elimina las anteriores antes de continuar.')
+  opts=w.generate_registration_options(rp_id=PASSKEY_RP,rp_name='UBERVZLA Driver',user_id=str(u['id']).encode(),user_name=u['login'],user_display_name=u['login'],attestation=st.AttestationConveyancePreference.NONE,authenticator_selection=st.AuthenticatorSelectionCriteria(authenticator_attachment=st.AuthenticatorAttachment.PLATFORM,resident_key=st.ResidentKeyRequirement.REQUIRED,user_verification=st.UserVerificationRequirement.REQUIRED),exclude_credentials=[st.PublicKeyCredentialDescriptor(id=x['id']) for x in rows],timeout=90000)
+  rid=pk_request(c,u['id'],'enroll',opts.challenge,pk_session_binding(r))
+  return {'request_id':rid,'options':json.loads(w.options_to_json(opts))}
+
+@app.post('/api/passkey/enroll/finish')
+def passkey_enroll_finish(data:PasskeyFinish,r:Request):
+ w,_=passkey_lib(r)
+ with tx() as c:
+  u=user(c,r)
+  row=pk_get(c,data.request_id,'enroll',pk_session_binding(r))
+  if row['uid']!=u['id'] or not qualified(c,u['id']): raise HTTPException(403,'Cuenta no autorizada')
+  if c.execute('SELECT COUNT(*) FROM driver_passkeys WHERE uid=?',(u['id'],)).fetchone()[0]>=5: raise HTTPException(409,'Máximo cinco llaves')
+  try:
+   v=w.verify_registration_response(credential=data.credential,expected_challenge=row['challenge'],expected_origin=PASSKEY_ORIGIN,expected_rp_id=PASSKEY_RP,require_user_verification=True)
+   c.execute('INSERT INTO driver_passkeys VALUES(?,?,?,?)',(v.credential_id,u['id'],v.credential_public_key,v.sign_count))
+  except Exception:
+   raise HTTPException(400,'No se pudo verificar o registrar la llave del dispositivo')
+  c.execute('DELETE FROM passkey_requests WHERE id=?',(row['id'],))
+  return {'registered':True}
+
+@app.post('/api/passkey/login/start')
+def passkey_login_start(data:PasskeyLogin,r:Request):
+ w,st=passkey_lib(r)
+ with tx() as c:
+  u=c.execute("SELECT * FROM users WHERE login=? AND role='driver'",(data.login.lower(),)).fetchone()
+  rows=c.execute('SELECT id FROM driver_passkeys WHERE uid=?',(u['id'],)).fetchall() if u and qualified(c,u['id']) else []
+  if not rows: raise HTTPException(401,'Acceso rápido no disponible. Usa el acceso normal.')
+  opts=w.generate_authentication_options(rp_id=PASSKEY_RP,allow_credentials=[st.PublicKeyCredentialDescriptor(id=x['id']) for x in rows],user_verification=st.UserVerificationRequirement.REQUIRED,timeout=90000)
+  nonce=secrets.token_urlsafe(32)
+  rid=pk_request(c,u['id'],'login',opts.challenge,hashlib.sha256(nonce.encode()).hexdigest())
+  res=JSONResponse({'request_id':rid,'options':json.loads(w.options_to_json(opts))},headers={'Cache-Control':'no-store'})
+  res.set_cookie('uv_pk_login',nonce,max_age=120,httponly=True,secure=True,samesite='strict',path='/api/passkey/login')
+  return res
+
+@app.post('/api/passkey/login/finish')
+def passkey_login_finish(data:PasskeyFinish,r:Request):
+ w,_=passkey_lib(r)
+ with tx() as c:
+  row=pk_get(c,data.request_id,'login',hashlib.sha256(r.cookies.get('uv_pk_login','').encode()).hexdigest())
+  u=c.execute("SELECT * FROM users WHERE id=? AND role='driver'",(row['uid'],)).fetchone()
+  if not u or not qualified(c,u['id']): raise HTTPException(403,'Cuenta no autorizada')
+  try:
+   cid=w.base64url_to_bytes(data.credential['rawId'])
+   key=c.execute('SELECT * FROM driver_passkeys WHERE id=? AND uid=?',(cid,u['id'])).fetchone()
+   if not key: raise ValueError('unknown credential')
+   response=data.credential.get('response',{})
+   if response.get('userHandle') and w.base64url_to_bytes(response['userHandle'])!=str(u['id']).encode(): raise ValueError('wrong user handle')
+   v=w.verify_authentication_response(credential=data.credential,expected_challenge=row['challenge'],expected_origin=PASSKEY_ORIGIN,expected_rp_id=PASSKEY_RP,credential_public_key=key['pubkey'],credential_current_sign_count=key['sign_count'],require_user_verification=True)
+   if v.credential_id!=cid: raise ValueError('credential mismatch')
+  except Exception:
+   raise HTTPException(401,'No se pudo verificar la llave del dispositivo')
+  c.execute('UPDATE driver_passkeys SET sign_count=? WHERE id=?',(v.new_sign_count,cid))
+  c.execute('DELETE FROM passkey_requests WHERE id=?',(row['id'],))
+  res=session(c,u);res.delete_cookie('uv_pk_login',path='/api/passkey/login',secure=True,httponly=True,samesite='strict');return res
+
+@app.post('/api/passkey/revoke')
+def passkey_revoke(data:PasskeyEnroll,r:Request):
+ passkey_lib(r)
+ with tx() as c:
+  u=user(c,r)
+  if not hmac.compare_digest(hashpw(data.password,u['pw'].split(':')[0]),u['pw']): raise HTTPException(401,'Contraseña incorrecta')
+  c.execute('DELETE FROM driver_passkeys WHERE uid=?',(u['id'],))
+  c.execute('DELETE FROM passkey_requests WHERE uid=?',(u['id'],))
+  return {'revoked':True}
