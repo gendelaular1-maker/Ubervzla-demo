@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 BASE=Path(__file__).parent
-DB=os.getenv('RUTIVA_DB',str(BASE/'rutiva.db'))
+DB=os.getenv('UBERVZLA_FOUNDATION_DB',str(BASE/'foundation.db'))
 TTL=int(os.getenv('OFFER_SECONDS','25'))
 ACTIVE=('accepted','arrived','in_progress')
 GPS_TTL=45
@@ -61,7 +61,7 @@ CHECKS={'identity':'Cédula de identidad','selfie':'Selfie y prueba de vida','ph
 EXPIRING=('license','medical','insurance')
 ONBOARD_DOCS=tuple(k for k in CHECKS if k!='selfie')
 def qualified(c,uid):
- return bool(c.execute("SELECT 1 FROM driver_reviews WHERE uid=? AND status='approved' AND expires>?",(uid,time.time())).fetchone())
+ return False  # Closed until an authorized production verification integration is implemented.
 def review_info(c,uid):
  row=c.execute('SELECT * FROM driver_reviews WHERE uid=?',(uid,)).fetchone()
  if not row: return {'status':'pending','submitted':False,'checks':{},'eligible':False}
@@ -110,7 +110,7 @@ def worker(stop):
   except Exception: import traceback; traceback.print_exc()
 @asynccontextmanager
 async def lifespan(app):
- init(); stop=threading.Event(); t=threading.Thread(target=worker,args=(stop,),daemon=True); t.start()
+ init(); foundation_init(); stop=threading.Event(); t=threading.Thread(target=worker,args=(stop,),daemon=True); t.start()
  yield
  stop.set(); t.join(timeout=3)
 app=FastAPI(title='UBERVZLA MVP',lifespan=lifespan,docs_url=None,redoc_url=None)
@@ -132,9 +132,9 @@ def public(u): return {k:u[k] for k in ('id','name','login','role','vehicle','zo
 def session(c,u,face=True):
  token=secrets.token_urlsafe(32); c.execute('DELETE FROM sessions WHERE expiry<?',(time.time(),)); c.execute('INSERT INTO sessions VALUES(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),u['id'],time.time()+86400))
  if u['role']=='driver' and face: c.execute('INSERT INTO demo_face_sessions VALUES(?)',(hashlib.sha256(token.encode()).hexdigest(),))
- res=JSONResponse(public(u)); res.set_cookie('ubervzla_'+u['role'],token,max_age=86400,httponly=True,samesite='strict',secure=os.getenv('RENDER')=='true' or os.getenv('SECURE_COOKIES')=='1'); return res
+ res=JSONResponse(public(u)); res.set_cookie('ubervzla_'+u['role'],token,max_age=86400,httponly=True,samesite='strict',secure=True); return res
 class Register(BaseModel):
- name:str=Field(min_length=2,max_length=40); login:str=Field(min_length=3,max_length=32,pattern=r'^[a-zA-Z0-9_-]+$'); password:str=Field(min_length=8,max_length=100); role:str; vehicle:str=''; zone:str='El Viñedo'; category:str=''
+ invite:str=Field(default='',max_length=100); name:str=Field(min_length=2,max_length=40); login:str=Field(min_length=3,max_length=32,pattern=r'^[a-zA-Z0-9_-]+$'); password:str=Field(min_length=12,max_length=100); role:str; vehicle:str=''; zone:str='El Viñedo'; category:str=''
 class Login(BaseModel):
  login:str=Field(max_length=32); password:str=Field(max_length=100)
 class Availability(BaseModel):
@@ -147,23 +147,28 @@ class Action(BaseModel):
  action:str
 @app.get('/')
 def home():
- return HTMLResponse('<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>UBERVZLA | Venezuela en movimiento</title><style>*{box-sizing:border-box}body{margin:0;font:15px system-ui,sans-serif;color:#111827;background:#f6f7fb}header{display:flex;align-items:center;justify-content:space-between;gap:14px;max-width:1200px;margin:auto;padding:19px 24px}header strong{font-size:26px;font-style:italic;letter-spacing:-1.1px;white-space:nowrap}.mark{display:inline-block;width:30px;height:24px;background:linear-gradient(0deg,#ef343e 0 30%,#275aff 30% 60%,#ffdb32 60%);clip-path:polygon(0 30%,90% 0,100% 32%,61% 46%,95% 46%,85% 73%,40% 83%,67% 83%,55% 100%,0 75%,48% 59%,3% 61%,49% 44%);vertical-align:middle;margin-right:5px}nav{display:flex;gap:24px}a{color:inherit;text-decoration:none}nav a{font-size:14px;font-weight:650}.cta{display:inline-flex;align-items:center;justify-content:center;background:#5236e9;color:white;border-radius:10px;padding:12px 19px;font-weight:750}.cta.secondary{border:1px solid #c5c9d5;color:#241d57;background:white}main{max-width:1200px;margin:auto;padding:0 24px}.hero{position:relative;overflow:hidden;background:#101827;color:white;border-radius:22px;display:grid;grid-template-columns:1.03fr .97fr;align-items:center;min-height:410px}.copy{padding:42px;position:relative;z-index:1}.eyebrow{color:#c3b8ff;font-size:11px;font-weight:800;letter-spacing:1.6px;text-transform:uppercase}.hero h1{font-size:clamp(34px,4.9vw,60px);letter-spacing:-2.2px;line-height:1.04;margin:16px 0}.hero p{font-size:16px;line-height:1.55;color:#d8dfed;max-width:420px}.hero .cta{margin-top:12px}.heroart{width:100%;height:100%;min-height:260px;object-fit:cover}.services{display:flex;gap:18px;margin-top:28px;font-weight:700;color:#dbe2f1;font-size:12px}.services span{display:grid;gap:6px}.services svg{width:28px;height:28px}.sectionhead{display:flex;justify-content:space-between;align-items:end;margin:28px 0 12px}.sectionhead h2{margin:0;font-size:24px;letter-spacing:-.7px}.sectionhead small{color:#647084}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.card{padding:21px;background:white;border:1px solid #e5e8ee;border-radius:17px;box-shadow:0 5px 15px #15213b08}.card .icon{display:grid;place-items:center;width:48px;height:48px;border-radius:13px;background:#f0edff;color:#4930e8}.card .icon svg{width:28px;height:28px}.card:nth-child(2) .icon{background:#e0fae8;color:#078b36}.card:nth-child(3) .icon{background:#fff1db;color:#94600a}.card h3{font-size:21px;letter-spacing:-.4px;margin:12px 0 7px}.card p{color:#647084;line-height:1.5;min-height:45px}.links{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.links a{font-size:13px;font-weight:750;color:#4930e8}.links .cta{color:white}.demo{border:1px solid #e3ddfa;background:#f0edff;color:#51487e;border-radius:12px;padding:12px;font-size:12px;margin:20px 0}footer{padding:14px 20px 24px;text-align:center;font-size:12px;color:#647084}@media(max-width:760px){header{padding:15px 13px}header strong{font-size:21px}header nav{display:none}header .cta{font-size:12px;padding:10px 12px}main{padding:0 11px}.hero{grid-template-columns:1fr;min-height:0;border-radius:18px}.copy{padding:24px 20px 10px}.hero h1{font-size:36px;letter-spacing:-1.5px}.hero p{font-size:14px}.heroart{max-height:245px;min-height:0}.services{margin-top:17px}.cards{grid-template-columns:1fr;gap:10px}.sectionhead{margin:20px 0 10px}.sectionhead h2{font-size:21px}.sectionhead small{display:none}.card{padding:16px}.card p{min-height:0}.card h3{font-size:19px}} </style></head><body><header><strong><i class="mark"></i>UBERVZLA</strong><nav><a href="#accesos">Servicios</a><a href="/driver">Conductores</a><a href="/comercio">Comercios</a></nav><a class="cta" href="#accesos">Iniciar sesión</a></header><main><section class="hero"><div class="copy"><span class="eyebrow">Venezuela en movimiento</span><h1>Transporte, compras y entregas en Venezuela.</h1><p>Una sola plataforma para moverte, comprar y recibir lo que necesitas.</p><a class="cta" href="/cliente?registro=1">Comenzar ahora →</a><div class="services"><span>◉ Viajes</span><span>▣ Compras</span><span>◇ Entregas</span></div></div><svg class="heroart" viewBox="0 0 500 370" role="img" aria-label="Ilustración de ciudad venezolana y vehículo de movilidad"><defs><linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#395587"/><stop offset="1" stop-color="#a8bddb"/></linearGradient><linearGradient id="car" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#fff"/><stop offset="1" stop-color="#aeb9c7"/></linearGradient></defs><rect width="500" height="370" fill="url(#sky)"/><circle cx="415" cy="72" r="34" fill="#f4df9c" opacity=".85"/><path d="M0 158 68 98 125 150 206 46 270 105 308 68 415 155 500 114V285H0Z" fill="#476a6e"/><path d="M0 200 80 137 160 185 218 126 297 190 385 121 500 200V290H0Z" fill="#315453"/><g fill="#c6b5a6"><path d="M22 191h39v98H22zM80 161h47v128H80zM152 205h44v84h-44zM210 178h42v111h-42zM280 150h52v139h-52zM357 193h46v96h-46zM430 174h48v115h-48z"/></g><g fill="#5e7283" opacity=".8"><rect x="28" y="199" width="7" height="10" rx="1"/><rect x="28" y="217" width="7" height="10" rx="1"/><rect x="28" y="235" width="7" height="10" rx="1"/><rect x="28" y="253" width="7" height="10" rx="1"/><rect x="28" y="271" width="7" height="10" rx="1"/><rect x="40" y="199" width="7" height="10" rx="1"/><rect x="40" y="217" width="7" height="10" rx="1"/><rect x="40" y="235" width="7" height="10" rx="1"/><rect x="40" y="253" width="7" height="10" rx="1"/><rect x="40" y="271" width="7" height="10" rx="1"/><rect x="52" y="199" width="7" height="10" rx="1"/><rect x="52" y="217" width="7" height="10" rx="1"/><rect x="52" y="235" width="7" height="10" rx="1"/><rect x="52" y="253" width="7" height="10" rx="1"/><rect x="52" y="271" width="7" height="10" rx="1"/><rect x="86" y="172" width="7" height="10" rx="1"/><rect x="86" y="190" width="7" height="10" rx="1"/><rect x="86" y="208" width="7" height="10" rx="1"/><rect x="86" y="226" width="7" height="10" rx="1"/><rect x="86" y="244" width="7" height="10" rx="1"/><rect x="86" y="262" width="7" height="10" rx="1"/><rect x="86" y="280" width="7" height="10" rx="1"/><rect x="98" y="172" width="7" height="10" rx="1"/><rect x="98" y="190" width="7" height="10" rx="1"/><rect x="98" y="208" width="7" height="10" rx="1"/><rect x="98" y="226" width="7" height="10" rx="1"/><rect x="98" y="244" width="7" height="10" rx="1"/><rect x="98" y="262" width="7" height="10" rx="1"/><rect x="98" y="280" width="7" height="10" rx="1"/><rect x="110" y="172" width="7" height="10" rx="1"/><rect x="110" y="190" width="7" height="10" rx="1"/><rect x="110" y="208" width="7" height="10" rx="1"/><rect x="110" y="226" width="7" height="10" rx="1"/><rect x="110" y="244" width="7" height="10" rx="1"/><rect x="110" y="262" width="7" height="10" rx="1"/><rect x="110" y="280" width="7" height="10" rx="1"/><rect x="158" y="214" width="7" height="10" rx="1"/><rect x="158" y="232" width="7" height="10" rx="1"/><rect x="158" y="250" width="7" height="10" rx="1"/><rect x="158" y="268" width="7" height="10" rx="1"/><rect x="170" y="214" width="7" height="10" rx="1"/><rect x="170" y="232" width="7" height="10" rx="1"/><rect x="170" y="250" width="7" height="10" rx="1"/><rect x="170" y="268" width="7" height="10" rx="1"/><rect x="182" y="214" width="7" height="10" rx="1"/><rect x="182" y="232" width="7" height="10" rx="1"/><rect x="182" y="250" width="7" height="10" rx="1"/><rect x="182" y="268" width="7" height="10" rx="1"/><rect x="216" y="187" width="7" height="10" rx="1"/><rect x="216" y="205" width="7" height="10" rx="1"/><rect x="216" y="223" width="7" height="10" rx="1"/><rect x="216" y="241" width="7" height="10" rx="1"/><rect x="216" y="259" width="7" height="10" rx="1"/><rect x="216" y="277" width="7" height="10" rx="1"/><rect x="228" y="187" width="7" height="10" rx="1"/><rect x="228" y="205" width="7" height="10" rx="1"/><rect x="228" y="223" width="7" height="10" rx="1"/><rect x="228" y="241" width="7" height="10" rx="1"/><rect x="228" y="259" width="7" height="10" rx="1"/><rect x="228" y="277" width="7" height="10" rx="1"/><rect x="240" y="187" width="7" height="10" rx="1"/><rect x="240" y="205" width="7" height="10" rx="1"/><rect x="240" y="223" width="7" height="10" rx="1"/><rect x="240" y="241" width="7" height="10" rx="1"/><rect x="240" y="259" width="7" height="10" rx="1"/><rect x="240" y="277" width="7" height="10" rx="1"/><rect x="286" y="162" width="7" height="10" rx="1"/><rect x="286" y="180" width="7" height="10" rx="1"/><rect x="286" y="198" width="7" height="10" rx="1"/><rect x="286" y="216" width="7" height="10" rx="1"/><rect x="286" y="234" width="7" height="10" rx="1"/><rect x="286" y="252" width="7" height="10" rx="1"/><rect x="286" y="270" width="7" height="10" rx="1"/><rect x="298" y="162" width="7" height="10" rx="1"/><rect x="298" y="180" width="7" height="10" rx="1"/><rect x="298" y="198" width="7" height="10" rx="1"/><rect x="298" y="216" width="7" height="10" rx="1"/><rect x="298" y="234" width="7" height="10" rx="1"/><rect x="298" y="252" width="7" height="10" rx="1"/><rect x="298" y="270" width="7" height="10" rx="1"/><rect x="310" y="162" width="7" height="10" rx="1"/><rect x="310" y="180" width="7" height="10" rx="1"/><rect x="310" y="198" width="7" height="10" rx="1"/><rect x="310" y="216" width="7" height="10" rx="1"/><rect x="310" y="234" width="7" height="10" rx="1"/><rect x="310" y="252" width="7" height="10" rx="1"/><rect x="310" y="270" width="7" height="10" rx="1"/><rect x="363" y="202" width="7" height="10" rx="1"/><rect x="363" y="220" width="7" height="10" rx="1"/><rect x="363" y="238" width="7" height="10" rx="1"/><rect x="363" y="256" width="7" height="10" rx="1"/><rect x="363" y="274" width="7" height="10" rx="1"/><rect x="375" y="202" width="7" height="10" rx="1"/><rect x="375" y="220" width="7" height="10" rx="1"/><rect x="375" y="238" width="7" height="10" rx="1"/><rect x="375" y="256" width="7" height="10" rx="1"/><rect x="375" y="274" width="7" height="10" rx="1"/><rect x="387" y="202" width="7" height="10" rx="1"/><rect x="387" y="220" width="7" height="10" rx="1"/><rect x="387" y="238" width="7" height="10" rx="1"/><rect x="387" y="256" width="7" height="10" rx="1"/><rect x="387" y="274" width="7" height="10" rx="1"/><rect x="436" y="185" width="7" height="10" rx="1"/><rect x="436" y="203" width="7" height="10" rx="1"/><rect x="436" y="221" width="7" height="10" rx="1"/><rect x="436" y="239" width="7" height="10" rx="1"/><rect x="436" y="257" width="7" height="10" rx="1"/><rect x="436" y="275" width="7" height="10" rx="1"/><rect x="448" y="185" width="7" height="10" rx="1"/><rect x="448" y="203" width="7" height="10" rx="1"/><rect x="448" y="221" width="7" height="10" rx="1"/><rect x="448" y="239" width="7" height="10" rx="1"/><rect x="448" y="257" width="7" height="10" rx="1"/><rect x="448" y="275" width="7" height="10" rx="1"/><rect x="460" y="185" width="7" height="10" rx="1"/><rect x="460" y="203" width="7" height="10" rx="1"/><rect x="460" y="221" width="7" height="10" rx="1"/><rect x="460" y="239" width="7" height="10" rx="1"/><rect x="460" y="257" width="7" height="10" rx="1"/><rect x="460" y="275" width="7" height="10" rx="1"/></g><path d="M0 287H500V370H0Z" fill="#343b49"/><path d="M0 346H500" stroke="#fff" stroke-width="3" stroke-dasharray="27 24" opacity=".6"/><ellipse cx="303" cy="337" rx="166" ry="17" fill="#111827" opacity=".4"/><g><path d="M127 293 169 280 208 236Q222 222 250 222h104q33 0 54 21l36 37 27 11q12 8 12 29v10H119v-21q0-11 8-16Z" fill="url(#car)" stroke="#8995a5" stroke-width="2"/><path d="M185 279 217 241q8-9 28-9h55v47Z M311 232h39q29 0 46 17l29 30H311Z" fill="#233347"/><path d="M122 307h359" stroke="#8995a5" stroke-width="2"/><path d="M151 325h288" stroke="#2e61f5" stroke-width="7"/><path d="M151 319h288" stroke="#ffd633" stroke-width="5"/><path d="M151 331h288" stroke="#ea3643" stroke-width="4"/><circle cx="188" cy="329" r="26" fill="#17202b"/><circle cx="188" cy="329" r="13" fill="#aab6c6"/><circle cx="423" cy="329" r="26" fill="#17202b"/><circle cx="423" cy="329" r="13" fill="#aab6c6"/><text x="267" y="302" font-size="16" font-weight="900" font-style="italic" font-family="system-ui" fill="#17243a">UBERVZLA</text></g></svg></section><div class="sectionhead" id="accesos"><h2>Elige tu plataforma</h2><small>Tres accesos independientes</small></div><section class="cards"><article class="card"><div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m5 11 2-6h10l2 6M3 11h18v7H3zM5 18v3m14-3v3M7 14h1m8 0h1"/></svg></div><h3>Soy cliente</h3><p>Pide viajes, compra en comercios y envía paquetes.</p><div class="links"><a class="cta" href="/cliente?registro=1">Registrarme</a><a href="/cliente">Entrar →</a></div></article><article class="card"><div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 12v9m-6-9 6 5 6-5"/></svg></div><h3>Quiero conducir</h3><p>Registra tu carro o moto y recibe ofertas de trabajo.</p><div class="links"><a class="cta" href="/driver?registro=1">Registrarme</a><a href="/driver">Entrar →</a></div></article><article class="card"><div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9h18L19 3H5zM5 9v12h14V9M9 21v-7h6v7"/></svg></div><h3>Soy comerciante</h3><p>Publica productos y recibe pedidos de tus clientes.</p><div class="links"><a class="cta" href="/comercio?registro=1">Registrarme</a><a href="/comercio">Entrar →</a></div></article></section><div class="demo"><b>Modo demostración.</b> Solo datos ficticios, sin cobros reales. GPS opcional y privado en lugares públicos. La ilustración es conceptual.</div></main><footer>UBERVZLA · v0.5 · Prototipo independiente · Venezuela</footer></body></html>',headers={'Cache-Control':'no-store'})
+ return HTMLResponse('<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>UBERVZLA | Venezuela en movimiento</title><style>*{box-sizing:border-box}body{margin:0;font:15px system-ui,sans-serif;color:#111827;background:#f6f7fb}header{display:flex;align-items:center;justify-content:space-between;gap:14px;max-width:1200px;margin:auto;padding:19px 24px}header strong{font-size:26px;font-style:italic;letter-spacing:-1.1px;white-space:nowrap}.mark{display:inline-block;width:30px;height:24px;background:linear-gradient(0deg,#ef343e 0 30%,#275aff 30% 60%,#ffdb32 60%);clip-path:polygon(0 30%,90% 0,100% 32%,61% 46%,95% 46%,85% 73%,40% 83%,67% 83%,55% 100%,0 75%,48% 59%,3% 61%,49% 44%);vertical-align:middle;margin-right:5px}nav{display:flex;gap:24px}a{color:inherit;text-decoration:none}nav a{font-size:14px;font-weight:650}.cta{display:inline-flex;align-items:center;justify-content:center;background:#5236e9;color:white;border-radius:10px;padding:12px 19px;font-weight:750}.cta.secondary{border:1px solid #c5c9d5;color:#241d57;background:white}main{max-width:1200px;margin:auto;padding:0 24px}.hero{position:relative;overflow:hidden;background:#101827;color:white;border-radius:22px;display:grid;grid-template-columns:1.03fr .97fr;align-items:center;min-height:410px}.copy{padding:42px;position:relative;z-index:1}.eyebrow{color:#c3b8ff;font-size:11px;font-weight:800;letter-spacing:1.6px;text-transform:uppercase}.hero h1{font-size:clamp(34px,4.9vw,60px);letter-spacing:-2.2px;line-height:1.04;margin:16px 0}.hero p{font-size:16px;line-height:1.55;color:#d8dfed;max-width:420px}.hero .cta{margin-top:12px}.heroart{width:100%;height:100%;min-height:260px;object-fit:cover}.services{display:flex;gap:18px;margin-top:28px;font-weight:700;color:#dbe2f1;font-size:12px}.services span{display:grid;gap:6px}.services svg{width:28px;height:28px}.sectionhead{display:flex;justify-content:space-between;align-items:end;margin:28px 0 12px}.sectionhead h2{margin:0;font-size:24px;letter-spacing:-.7px}.sectionhead small{color:#647084}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.card{padding:21px;background:white;border:1px solid #e5e8ee;border-radius:17px;box-shadow:0 5px 15px #15213b08}.card .icon{display:grid;place-items:center;width:48px;height:48px;border-radius:13px;background:#f0edff;color:#4930e8}.card .icon svg{width:28px;height:28px}.card:nth-child(2) .icon{background:#e0fae8;color:#078b36}.card:nth-child(3) .icon{background:#fff1db;color:#94600a}.card h3{font-size:21px;letter-spacing:-.4px;margin:12px 0 7px}.card p{color:#647084;line-height:1.5;min-height:45px}.links{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.links a{font-size:13px;font-weight:750;color:#4930e8}.links .cta{color:white}.demo{border:1px solid #e3ddfa;background:#f0edff;color:#51487e;border-radius:12px;padding:12px;font-size:12px;margin:20px 0}footer{padding:14px 20px 24px;text-align:center;font-size:12px;color:#647084}@media(max-width:760px){header{padding:15px 13px}header strong{font-size:21px}header nav{display:none}header .cta{font-size:12px;padding:10px 12px}main{padding:0 11px}.hero{grid-template-columns:1fr;min-height:0;border-radius:18px}.copy{padding:24px 20px 10px}.hero h1{font-size:36px;letter-spacing:-1.5px}.hero p{font-size:14px}.heroart{max-height:245px;min-height:0}.services{margin-top:17px}.cards{grid-template-columns:1fr;gap:10px}.sectionhead{margin:20px 0 10px}.sectionhead h2{font-size:21px}.sectionhead small{display:none}.card{padding:16px}.card p{min-height:0}.card h3{font-size:19px}} </style></head><body><header><strong><i class="mark"></i>UBERVZLA</strong><nav><a href="#accesos">Servicios</a><a href="/driver">Conductores</a><a href="/comercio">Comercios</a></nav><a class="cta" href="#accesos">Iniciar sesión</a></header><main><section class="hero"><div class="copy"><span class="eyebrow">Venezuela en movimiento</span><h1>Transporte, compras y entregas en Venezuela.</h1><p>Una sola plataforma para moverte, comprar y recibir lo que necesitas.</p><a class="cta" href="/cliente?registro=1">Comenzar ahora →</a><div class="services"><span>◉ Viajes</span><span>▣ Compras</span><span>◇ Entregas</span></div></div><svg class="heroart" viewBox="0 0 500 370" role="img" aria-label="Ilustración de ciudad venezolana y vehículo de movilidad"><defs><linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#395587"/><stop offset="1" stop-color="#a8bddb"/></linearGradient><linearGradient id="car" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#fff"/><stop offset="1" stop-color="#aeb9c7"/></linearGradient></defs><rect width="500" height="370" fill="url(#sky)"/><circle cx="415" cy="72" r="34" fill="#f4df9c" opacity=".85"/><path d="M0 158 68 98 125 150 206 46 270 105 308 68 415 155 500 114V285H0Z" fill="#476a6e"/><path d="M0 200 80 137 160 185 218 126 297 190 385 121 500 200V290H0Z" fill="#315453"/><g fill="#c6b5a6"><path d="M22 191h39v98H22zM80 161h47v128H80zM152 205h44v84h-44zM210 178h42v111h-42zM280 150h52v139h-52zM357 193h46v96h-46zM430 174h48v115h-48z"/></g><g fill="#5e7283" opacity=".8"><rect x="28" y="199" width="7" height="10" rx="1"/><rect x="28" y="217" width="7" height="10" rx="1"/><rect x="28" y="235" width="7" height="10" rx="1"/><rect x="28" y="253" width="7" height="10" rx="1"/><rect x="28" y="271" width="7" height="10" rx="1"/><rect x="40" y="199" width="7" height="10" rx="1"/><rect x="40" y="217" width="7" height="10" rx="1"/><rect x="40" y="235" width="7" height="10" rx="1"/><rect x="40" y="253" width="7" height="10" rx="1"/><rect x="40" y="271" width="7" height="10" rx="1"/><rect x="52" y="199" width="7" height="10" rx="1"/><rect x="52" y="217" width="7" height="10" rx="1"/><rect x="52" y="235" width="7" height="10" rx="1"/><rect x="52" y="253" width="7" height="10" rx="1"/><rect x="52" y="271" width="7" height="10" rx="1"/><rect x="86" y="172" width="7" height="10" rx="1"/><rect x="86" y="190" width="7" height="10" rx="1"/><rect x="86" y="208" width="7" height="10" rx="1"/><rect x="86" y="226" width="7" height="10" rx="1"/><rect x="86" y="244" width="7" height="10" rx="1"/><rect x="86" y="262" width="7" height="10" rx="1"/><rect x="86" y="280" width="7" height="10" rx="1"/><rect x="98" y="172" width="7" height="10" rx="1"/><rect x="98" y="190" width="7" height="10" rx="1"/><rect x="98" y="208" width="7" height="10" rx="1"/><rect x="98" y="226" width="7" height="10" rx="1"/><rect x="98" y="244" width="7" height="10" rx="1"/><rect x="98" y="262" width="7" height="10" rx="1"/><rect x="98" y="280" width="7" height="10" rx="1"/><rect x="110" y="172" width="7" height="10" rx="1"/><rect x="110" y="190" width="7" height="10" rx="1"/><rect x="110" y="208" width="7" height="10" rx="1"/><rect x="110" y="226" width="7" height="10" rx="1"/><rect x="110" y="244" width="7" height="10" rx="1"/><rect x="110" y="262" width="7" height="10" rx="1"/><rect x="110" y="280" width="7" height="10" rx="1"/><rect x="158" y="214" width="7" height="10" rx="1"/><rect x="158" y="232" width="7" height="10" rx="1"/><rect x="158" y="250" width="7" height="10" rx="1"/><rect x="158" y="268" width="7" height="10" rx="1"/><rect x="170" y="214" width="7" height="10" rx="1"/><rect x="170" y="232" width="7" height="10" rx="1"/><rect x="170" y="250" width="7" height="10" rx="1"/><rect x="170" y="268" width="7" height="10" rx="1"/><rect x="182" y="214" width="7" height="10" rx="1"/><rect x="182" y="232" width="7" height="10" rx="1"/><rect x="182" y="250" width="7" height="10" rx="1"/><rect x="182" y="268" width="7" height="10" rx="1"/><rect x="216" y="187" width="7" height="10" rx="1"/><rect x="216" y="205" width="7" height="10" rx="1"/><rect x="216" y="223" width="7" height="10" rx="1"/><rect x="216" y="241" width="7" height="10" rx="1"/><rect x="216" y="259" width="7" height="10" rx="1"/><rect x="216" y="277" width="7" height="10" rx="1"/><rect x="228" y="187" width="7" height="10" rx="1"/><rect x="228" y="205" width="7" height="10" rx="1"/><rect x="228" y="223" width="7" height="10" rx="1"/><rect x="228" y="241" width="7" height="10" rx="1"/><rect x="228" y="259" width="7" height="10" rx="1"/><rect x="228" y="277" width="7" height="10" rx="1"/><rect x="240" y="187" width="7" height="10" rx="1"/><rect x="240" y="205" width="7" height="10" rx="1"/><rect x="240" y="223" width="7" height="10" rx="1"/><rect x="240" y="241" width="7" height="10" rx="1"/><rect x="240" y="259" width="7" height="10" rx="1"/><rect x="240" y="277" width="7" height="10" rx="1"/><rect x="286" y="162" width="7" height="10" rx="1"/><rect x="286" y="180" width="7" height="10" rx="1"/><rect x="286" y="198" width="7" height="10" rx="1"/><rect x="286" y="216" width="7" height="10" rx="1"/><rect x="286" y="234" width="7" height="10" rx="1"/><rect x="286" y="252" width="7" height="10" rx="1"/><rect x="286" y="270" width="7" height="10" rx="1"/><rect x="298" y="162" width="7" height="10" rx="1"/><rect x="298" y="180" width="7" height="10" rx="1"/><rect x="298" y="198" width="7" height="10" rx="1"/><rect x="298" y="216" width="7" height="10" rx="1"/><rect x="298" y="234" width="7" height="10" rx="1"/><rect x="298" y="252" width="7" height="10" rx="1"/><rect x="298" y="270" width="7" height="10" rx="1"/><rect x="310" y="162" width="7" height="10" rx="1"/><rect x="310" y="180" width="7" height="10" rx="1"/><rect x="310" y="198" width="7" height="10" rx="1"/><rect x="310" y="216" width="7" height="10" rx="1"/><rect x="310" y="234" width="7" height="10" rx="1"/><rect x="310" y="252" width="7" height="10" rx="1"/><rect x="310" y="270" width="7" height="10" rx="1"/><rect x="363" y="202" width="7" height="10" rx="1"/><rect x="363" y="220" width="7" height="10" rx="1"/><rect x="363" y="238" width="7" height="10" rx="1"/><rect x="363" y="256" width="7" height="10" rx="1"/><rect x="363" y="274" width="7" height="10" rx="1"/><rect x="375" y="202" width="7" height="10" rx="1"/><rect x="375" y="220" width="7" height="10" rx="1"/><rect x="375" y="238" width="7" height="10" rx="1"/><rect x="375" y="256" width="7" height="10" rx="1"/><rect x="375" y="274" width="7" height="10" rx="1"/><rect x="387" y="202" width="7" height="10" rx="1"/><rect x="387" y="220" width="7" height="10" rx="1"/><rect x="387" y="238" width="7" height="10" rx="1"/><rect x="387" y="256" width="7" height="10" rx="1"/><rect x="387" y="274" width="7" height="10" rx="1"/><rect x="436" y="185" width="7" height="10" rx="1"/><rect x="436" y="203" width="7" height="10" rx="1"/><rect x="436" y="221" width="7" height="10" rx="1"/><rect x="436" y="239" width="7" height="10" rx="1"/><rect x="436" y="257" width="7" height="10" rx="1"/><rect x="436" y="275" width="7" height="10" rx="1"/><rect x="448" y="185" width="7" height="10" rx="1"/><rect x="448" y="203" width="7" height="10" rx="1"/><rect x="448" y="221" width="7" height="10" rx="1"/><rect x="448" y="239" width="7" height="10" rx="1"/><rect x="448" y="257" width="7" height="10" rx="1"/><rect x="448" y="275" width="7" height="10" rx="1"/><rect x="460" y="185" width="7" height="10" rx="1"/><rect x="460" y="203" width="7" height="10" rx="1"/><rect x="460" y="221" width="7" height="10" rx="1"/><rect x="460" y="239" width="7" height="10" rx="1"/><rect x="460" y="257" width="7" height="10" rx="1"/><rect x="460" y="275" width="7" height="10" rx="1"/></g><path d="M0 287H500V370H0Z" fill="#343b49"/><path d="M0 346H500" stroke="#fff" stroke-width="3" stroke-dasharray="27 24" opacity=".6"/><ellipse cx="303" cy="337" rx="166" ry="17" fill="#111827" opacity=".4"/><g><path d="M127 293 169 280 208 236Q222 222 250 222h104q33 0 54 21l36 37 27 11q12 8 12 29v10H119v-21q0-11 8-16Z" fill="url(#car)" stroke="#8995a5" stroke-width="2"/><path d="M185 279 217 241q8-9 28-9h55v47Z M311 232h39q29 0 46 17l29 30H311Z" fill="#233347"/><path d="M122 307h359" stroke="#8995a5" stroke-width="2"/><path d="M151 325h288" stroke="#2e61f5" stroke-width="7"/><path d="M151 319h288" stroke="#ffd633" stroke-width="5"/><path d="M151 331h288" stroke="#ea3643" stroke-width="4"/><circle cx="188" cy="329" r="26" fill="#17202b"/><circle cx="188" cy="329" r="13" fill="#aab6c6"/><circle cx="423" cy="329" r="26" fill="#17202b"/><circle cx="423" cy="329" r="13" fill="#aab6c6"/><text x="267" y="302" font-size="16" font-weight="900" font-style="italic" font-family="system-ui" fill="#17243a">UBERVZLA</text></g></svg></section><div class="sectionhead" id="accesos"><h2>Elige tu plataforma</h2><small>Tres accesos independientes</small></div><section class="cards"><article class="card"><div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m5 11 2-6h10l2 6M3 11h18v7H3zM5 18v3m14-3v3M7 14h1m8 0h1"/></svg></div><h3>Soy cliente</h3><p>Pide viajes, compra en comercios y envía paquetes.</p><div class="links"><a class="cta" href="/cliente?registro=1">Registrarme</a><a href="/cliente">Entrar →</a></div></article><article class="card"><div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 12v9m-6-9 6 5 6-5"/></svg></div><h3>Quiero conducir</h3><p>Registra tu carro o moto y recibe ofertas de trabajo.</p><div class="links"><a class="cta" href="/driver?registro=1">Registrarme</a><a href="/driver">Entrar →</a></div></article><article class="card"><div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9h18L19 3H5zM5 9v12h14V9M9 21v-7h6v7"/></svg></div><h3>Soy comerciante</h3><p>Publica productos y recibe pedidos de tus clientes.</p><div class="links"><a class="cta" href="/comercio?registro=1">Registrarme</a><a href="/comercio">Entrar →</a></div></article></section><div class="demo"><b>Inscripción privada.</b> Recepción de expedientes desactivada hasta completar seguridad y privacidad. Sin cobros ni viajes habilitados.</div></main><footer>UBERVZLA · Base de inscripción privada · Venezuela · <a href="/soporte">Soporte</a></footer></body></html>',headers={'Cache-Control':'no-store'})
 @app.get('/cliente')
 @app.get('/driver')
 @app.get('/comercio')
 def portal_page(r:Request):
  role={'/cliente':'customer','/driver':'driver','/comercio':'merchant'}[r.url.path]
- return HTMLResponse((BASE/('driver.html' if role=='driver' else 'index.html')).read_text(encoding='utf-8').replace('__PORTAL_ROLE__',role),headers={'Cache-Control':'no-store'})
+ return HTMLResponse((BASE/'driver.html').read_text(encoding='utf-8'),headers={'Cache-Control':'no-store'}) if role=='driver' else HTMLResponse('<h1>UBERVZLA</h1><p>Este portal aún no está habilitado.</p><a href="/driver">Conductores</a>',status_code=503)
 @app.get('/health')
 def health():
  with connect() as c: c.execute('SELECT 1 FROM users LIMIT 1')
- return {'status':'ok','version':'0.7.3-documents-first-demo','mode':'TEST_ONLY'}
+ return {'status':'ok','version':'0.8.1-private-intake-foundation','mode':'INTAKE_ONLY','dispatch_enabled':False,'payout_enabled':False}
 @app.post('/api/register')
 def register(data:Register,r:Request):
  if data.role!=portal(r): raise HTTPException(403,'Registro no corresponde a esta plataforma')
  if data.role not in ('customer','driver','merchant') or data.zone not in POINTS or (data.role=='driver' and data.vehicle not in ('car','moto')): raise HTTPException(400,'Datos inválidos')
  if data.role=='merchant' and data.category not in ('Restaurante','Supermercado','Farmacia','Panadería','Tienda','Otro'): raise HTTPException(400,'Categoría inválida')
  with tx() as c:
+  digest=hashlib.sha256(data.invite.encode()).hexdigest()
+  configured={v.strip().lower() for v in os.getenv('UBERVZLA_INVITE_HASHES','').split(',') if re.fullmatch(r'[a-fA-F0-9]{64}',v.strip())}
+  if digest not in configured: raise HTTPException(403,'Invitación privada inválida')
+  try: c.execute('INSERT INTO intake_invites_used(digest,used) VALUES(?,?)',(digest,time.time()))
+  except sqlite3.IntegrityError: raise HTTPException(403,'Invitación ya utilizada')
   try: i=c.execute('INSERT INTO users(name,login,pw,role,vehicle,zone) VALUES(?,?,?,?,?,?)',(data.name.strip(),data.login.lower(),hashpw(data.password),data.role,data.vehicle if data.role=='driver' else '',data.zone)).lastrowid
   except sqlite3.IntegrityError: raise HTTPException(409,'Ese usuario ya existe')
   if data.role=='driver': c.execute('INSERT INTO driver_reviews(uid) VALUES(?)',(i,))
@@ -175,7 +180,7 @@ def login(data:Login,r:Request):
  with tx() as c:
   u=c.execute('SELECT * FROM users WHERE login=?',(data.login.lower(),)).fetchone()
   if not u or u['role']!=portal(r) or not hmac.compare_digest(u['pw'],hashpw(data.password,u['pw'].split(':')[0])): raise HTTPException(401,'Usuario o clave incorrectos')
-  return face_challenge(c,u,'login') if u['role']=='driver' and review_info(c,u['id'])['submitted'] else session(c,u,face=False)
+  return session(c,u,face=False)  # Applicant access only, never authorization to drive.
 @app.post('/api/logout')
 def logout(r:Request):
  with tx() as c:
@@ -529,3 +534,149 @@ def passkey_revoke(data:PasskeyEnroll,r:Request):
   c.execute('DELETE FROM driver_passkeys WHERE uid=?',(u['id'],))
   c.execute('DELETE FROM passkey_requests WHERE uid=?',(u['id'],))
   return {'revoked':True}
+
+# v0.8: controlled onboarding foundation; all legacy simulated mutations are disabled.
+from cryptography.fernet import Fernet, InvalidToken
+import base64, binascii, re
+from fastapi.responses import Response
+
+DOCS = ('identity','license','medical','title','circulation','insurance','background','vehicle','selfie')
+MAX_FILE=3*1024*1024
+
+def foundation_init():
+ with tx() as c:
+  c.execute('CREATE TABLE IF NOT EXISTS intake_invites_used(digest TEXT PRIMARY KEY,used REAL NOT NULL)')
+  c.execute('CREATE TABLE IF NOT EXISTS intake_profiles(uid INTEGER PRIMARY KEY REFERENCES users(id), payload BLOB NOT NULL, submitted INTEGER NOT NULL DEFAULT 0, updated REAL NOT NULL)')
+  c.execute('CREATE TABLE IF NOT EXISTS intake_files(uid INTEGER REFERENCES users(id), kind TEXT, payload BLOB NOT NULL, mime TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY(uid,kind))')
+  c.execute('UPDATE users SET online=0')
+  c.execute("UPDATE driver_reviews SET status='pending',submitted=0,expires=0,checks='{}'")
+
+def vault():
+ if os.getenv('UBERVZLA_INTAKE_ENABLED')!='1': raise HTTPException(503,'Recepción de documentos desactivada por seguridad')
+ path=os.getenv('UBERVZLA_FOUNDATION_DB','')
+ if not path or not Path(path).is_absolute() or not str(Path(path).resolve()).startswith('/var/data/'):
+  raise HTTPException(503,'Configura almacenamiento persistente privado antes de recibir datos')
+ try: return Fernet(os.environ['UBERVZLA_VAULT_KEY'].encode())
+ except (KeyError, ValueError): raise HTTPException(503,'Almacenamiento cifrado no configurado')
+
+@app.middleware('http')
+async def production_guard(request, call_next):
+ p=request.url.path.rstrip('/') or '/'
+ if p.startswith('/api/') and request.method in ('GET','HEAD') and p not in ('/api/intake/status','/api/intake/admin','/api/support/contact'):
+  return JSONResponse({'detail':'Módulo no habilitado'},status_code=403)
+ if p.startswith('/api/') and request.method not in ('GET','HEAD'):
+  if p not in ('/api/register','/api/login','/api/logout','/api/intake/profile','/api/intake/file','/api/intake/submit'):
+   return JSONResponse({'detail':'Operación bloqueada: falta integración de seguridad o pagos real'},status_code=403)
+  if request.headers.get('origin') not in (PASSKEY_ORIGIN,):
+   return JSONResponse({'detail':'Origen no autorizado'},status_code=403)
+  if p in ('/api/register','/api/login','/api/intake/profile','/api/intake/file','/api/intake/submit'):
+   try: vault()
+   except HTTPException as e: return JSONResponse({'detail':e.detail},status_code=e.status_code)
+  if p in ('/api/register','/api/login') and request.headers.get('X-Portal')!='driver':
+   return JSONResponse({'detail':'Este portal aún no está habilitado'},status_code=403)
+  if p=='/api/intake/file':
+   try: size=int(request.headers.get('content-length','0'))
+   except ValueError: size=0
+   if not 0<size<MAX_FILE*2: return JSONResponse({'detail':'Tamaño inválido'},status_code=413)
+ response=await call_next(request)
+ response.headers['Cache-Control']='no-store'
+ response.headers['X-Content-Type-Options']='nosniff'
+ response.headers['Referrer-Policy']='no-referrer'
+ response.headers['X-Frame-Options']='DENY'
+ return response
+
+class IntakeProfile(BaseModel):
+ full_name:str=Field(min_length=3,max_length=100)
+ identity:str=Field(pattern=r'^[VE]-[0-9]{5,10}$')
+ phone:str=Field(pattern=r'^\+58[0-9]{10}$')
+ email:str=Field(min_length=5,max_length=160,pattern=r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
+ state:str=Field(min_length=2,max_length=80)
+ municipality:str=Field(min_length=2,max_length=80)
+ vehicle:str=Field(pattern=r'^(car|moto)$')
+ plate:str=Field(min_length=3,max_length=12)
+ license_expiry:date
+ medical_expiry:date
+ insurance_expiry:date
+ consent:bool
+
+class IntakeFile(BaseModel):
+ kind:str
+ content:str=Field(max_length=MAX_FILE*2)
+
+@app.get('/api/intake/status')
+def intake_status(r:Request):
+ with tx() as c:
+  u=user(c,r)
+  if u['role']!='driver': raise HTTPException(403,'Solo aspirantes')
+  row=c.execute('SELECT submitted FROM intake_profiles WHERE uid=?',(u['id'],)).fetchone()
+  files=[x['kind'] for x in c.execute('SELECT kind FROM intake_files WHERE uid=?',(u['id'],))]
+  return {'profile_saved':bool(row),'submitted':bool(row and row['submitted']),'files':files,'eligible':False,'status':'awaiting_verification' if row and row['submitted'] else 'incomplete'}
+
+def intake_user(c,r):
+ u=user(c,r)
+ if u['role']!='driver': raise HTTPException(403,'Solo aspirantes')
+ row=c.execute('SELECT submitted FROM intake_profiles WHERE uid=?',(u['id'],)).fetchone()
+ if row and row['submitted']: raise HTTPException(409,'Expediente enviado; solicita una corrección al administrador')
+ return u,row
+
+@app.post('/api/intake/profile')
+def intake_profile(data:IntakeProfile,r:Request):
+ key=vault()
+ if not data.consent: raise HTTPException(400,'Debes aceptar el tratamiento de datos')
+ if min(data.license_expiry,data.medical_expiry,data.insurance_expiry)<date.today(): raise HTTPException(400,'Documentación vencida')
+ with tx() as c:
+  u,_=intake_user(c,r)
+  if u['vehicle']!=data.vehicle: raise HTTPException(400,'El vehículo debe coincidir con el registro')
+  c.execute('INSERT INTO intake_profiles(uid,payload,submitted,updated) VALUES(?,?,0,?) ON CONFLICT(uid) DO UPDATE SET payload=excluded.payload,updated=excluded.updated',(u['id'],key.encrypt(data.model_dump_json().encode()),time.time()))
+ return {'saved':True}
+
+@app.post('/api/intake/file')
+def intake_file(data:IntakeFile,r:Request):
+ key=vault()
+ if data.kind not in DOCS: raise HTTPException(400,'Documento inválido')
+ try: raw=base64.b64decode(data.content,validate=True)
+ except (ValueError,binascii.Error): raise HTTPException(400,'Archivo inválido')
+ if not 0<len(raw)<=MAX_FILE: raise HTTPException(413,'Máximo 3 MB por archivo')
+ if raw.startswith(b'\xff\xd8\xff'): mime='image/jpeg'
+ elif raw.startswith(b'\x89PNG\r\n\x1a\n'): mime='image/png'
+ elif raw.startswith(b'%PDF-') and data.kind!='selfie': mime='application/pdf'
+ else: raise HTTPException(400,'Solo JPG, PNG o PDF; selfie solo imagen')
+ with tx() as c:
+  u,row=intake_user(c,r)
+  if not row: raise HTTPException(409,'Completa los datos primero')
+  if data.kind=='selfie':
+   found={x['kind'] for x in c.execute('SELECT kind FROM intake_files WHERE uid=?',(u['id'],))}
+   if not set(DOCS[:-1])<=found: raise HTTPException(409,'Completa los documentos antes de la selfie')
+  else: c.execute("DELETE FROM intake_files WHERE uid=? AND kind='selfie'",(u['id'],))
+  c.execute('INSERT INTO intake_files VALUES(?,?,?,?,?) ON CONFLICT(uid,kind) DO UPDATE SET payload=excluded.payload,mime=excluded.mime,updated=excluded.updated',(u['id'],data.kind,key.encrypt(raw),mime,time.time()))
+ return {'received':True,'verified':False}
+
+@app.post('/api/intake/submit')
+def intake_submit(r:Request):
+ vault()
+ with tx() as c:
+  u,row=intake_user(c,r)
+  found={x['kind'] for x in c.execute('SELECT kind FROM intake_files WHERE uid=?',(u['id'],))}
+  if not row or found!=set(DOCS): raise HTTPException(409,'Expediente incompleto')
+  c.execute('UPDATE intake_profiles SET submitted=1,updated=? WHERE uid=?',(time.time(),u['id']))
+ return {'submitted':True,'eligible':False,'status':'awaiting_verification'}
+
+@app.get('/api/intake/admin')
+def intake_admin(r:Request):
+ admin_auth(r);key=vault()
+ with tx() as c:
+  result=[]
+  for x in c.execute('SELECT uid,payload,submitted,updated FROM intake_profiles ORDER BY updated DESC LIMIT 100'):
+   data=json.loads(key.decrypt(x['payload'])); files=[z['kind'] for z in c.execute('SELECT kind FROM intake_files WHERE uid=?',(x['uid'],))]
+   result.append({'id':x['uid'],'name':data['full_name'],'vehicle':data['vehicle'],'state':data['state'],'submitted':bool(x['submitted']),'files':files,'eligible':False})
+  return {'applicants':result,'approval_enabled':False}
+
+
+@app.get('/soporte')
+def support_page():
+ return FileResponse(BASE/'support.html',media_type='text/html')
+
+@app.get('/api/support/contact')
+def support_contact():
+ email=os.getenv('UBERVZLA_SUPPORT_EMAIL','').strip()
+ return {'email':email if re.fullmatch(r"[A-Za-z0-9._+%-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",email) else None}
